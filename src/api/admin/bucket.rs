@@ -337,6 +337,42 @@ impl RequestHandler for UpdateBucketRequest {
 			}
 		}
 
+		if let Some(v) = self.body.versioning {
+			let new_state = v.into_garage_versioning_state();
+			// Once versioning has been enabled on a bucket, it can only be
+			// suspended: the versions it has created are kept until they are
+			// explicitly deleted.
+			if new_state == VersioningState::Disabled
+				&& state.versioning() != VersioningState::Disabled
+			{
+				return Err(Error::bad_request(
+					"Versioning cannot be disabled once it has been enabled, only suspended",
+				));
+			}
+			// Object Lock relies on versioning to keep the versions it
+			// protects, so versioning cannot be suspended while it is enabled.
+			if new_state == VersioningState::Suspended && state.object_lock().is_some() {
+				return Err(Error::bad_request(
+					"Versioning cannot be suspended on a bucket that has Object Lock enabled",
+				));
+			}
+			if state.versioning() != new_state {
+				state.versioning.update(new_state);
+			}
+		}
+
+		if let Some(ol) = self.body.object_lock {
+			// Object Lock protects versions of objects, so it can only be
+			// turned on for a bucket that keeps them.
+			if state.versioning() != VersioningState::Enabled {
+				return Err(Error::bad_request(
+					"Object Lock requires bucket versioning to be enabled",
+				));
+			}
+			let config = ol.into_garage_object_lock_config()?;
+			state.object_lock.update(Some(config).into());
+		}
+
 		if let Some(q) = self.body.quotas {
 			state.quotas.update(BucketQuotas {
 				max_size: q.max_size,
@@ -517,6 +553,21 @@ impl RequestHandler for InspectObjectRequest {
 						..Default::default()
 					});
 				}
+			}
+
+			// The versioning and Object Lock information is the same whatever
+			// the state of the version, so it is filled in afterwards
+			if let Some(v) = versions.last_mut() {
+				v.s3_version_id = obj_ver.version_id();
+				v.retention = obj_ver.retention.get().map(|r| InspectObjectRetention {
+					mode: match r.mode {
+						ObjectLockMode::Governance => ApiObjectLockMode::Governance,
+						ObjectLockMode::Compliance => ApiObjectLockMode::Compliance,
+					},
+					retain_until: DateTime::from_timestamp_millis(r.retain_until as i64)
+						.expect("invalid retain-until date stored in db"),
+				});
+				v.legal_hold = *obj_ver.legal_hold.get();
 			}
 		}
 
@@ -752,6 +803,10 @@ async fn bucket_info_results(
 				.map(xml::cors::CorsRule::from_garage_cors_rule)
 				.collect::<Vec<_>>()
 		}),
+		versioning: ApiBucketVersioning::from_garage_versioning_state(state.versioning()),
+		object_lock: state
+			.object_lock()
+			.map(ApiObjectLockConfig::from_garage_object_lock_config),
 		lifecycle_rules: state.lifecycle_config.get().inner().map(|lc| {
 			lc.iter()
 				.map(xml::lifecycle::LifecycleRule::from_garage_lifecycle_rule)

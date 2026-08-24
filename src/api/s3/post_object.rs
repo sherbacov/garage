@@ -25,7 +25,9 @@ use garage_api_common::signature::payload::{verify_v4, Authorization};
 use crate::api_server::ResBody;
 use crate::encryption::{EncryptionParams, OekDerivationInfo};
 use crate::error::*;
+use crate::object_lock::object_lock_from_headers;
 use crate::put::{extract_metadata_headers, save_stream, ChecksumMode};
+use crate::versioning::{response_version_id, X_AMZ_VERSION_ID};
 use crate::xml as s3_xml;
 
 pub async fn handle_post_object(
@@ -273,6 +275,8 @@ pub async fn handle_post_object(
 		api_key,
 	};
 
+	let object_lock = object_lock_from_headers(&ctx.bucket_params, &params)?;
+
 	let res = save_stream(
 		&ctx,
 		version_uuid,
@@ -281,10 +285,12 @@ pub async fn handle_post_object(
 		StreamLimiter::new(stream, conditions.content_length),
 		&key,
 		ChecksumMode::Verify(expected_checksums),
+		object_lock,
 	)
 	.await?;
 
 	let etag = format!("\"{}\"", res.etag);
+	let version_id = response_version_id(&ctx.bucket_params, res.version_uuid);
 
 	let mut resp = if let Some(mut target) = params
 		.get("success_action_redirect")
@@ -301,6 +307,7 @@ pub async fn handle_post_object(
 		let mut resp = Response::builder()
 			.status(StatusCode::SEE_OTHER)
 			.header(header::LOCATION, target.clone())
+			.header(X_AMZ_VERSION_ID, version_id)
 			.header(header::ETAG, etag);
 		encryption.add_response_headers(&mut resp);
 		resp.body(string_body(target))?
@@ -332,6 +339,7 @@ pub async fn handle_post_object(
 			.unwrap_or("204");
 		let mut builder = Response::builder()
 			.header(header::LOCATION, location.clone())
+			.header(X_AMZ_VERSION_ID, version_id)
 			.header(header::ETAG, etag.clone());
 		encryption.add_response_headers(&mut builder);
 		match action {

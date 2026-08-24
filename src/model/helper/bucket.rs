@@ -208,19 +208,25 @@ impl<'a> BucketHelper<'a> {
 	// ----
 
 	pub async fn is_bucket_empty(&self, bucket_id: Uuid) -> Result<bool, Error> {
-		let objects = self
-			.0
-			.object_table
-			.get_range(
-				&bucket_id,
-				None,
-				Some(ObjectFilter::IsData),
-				10,
-				EnumerationOrder::Forward,
-			)
-			.await?;
-		if !objects.is_empty() {
-			return Ok(false);
+		// A bucket still holds data if any object currently exists, but also if
+		// any object has versions that are retained: on a versioned bucket
+		// those are still listed by ListObjectVersions and can be read back,
+		// and Object Lock may forbid deleting them.
+		for filter in [ObjectFilter::IsData, ObjectFilter::HasRetainedVersions] {
+			let objects = self
+				.0
+				.object_table
+				.get_range(
+					&bucket_id,
+					None,
+					Some(filter),
+					10,
+					EnumerationOrder::Forward,
+				)
+				.await?;
+			if !objects.is_empty() {
+				return Ok(false);
+			}
 		}
 
 		#[cfg(feature = "k2v")]
@@ -292,8 +298,7 @@ impl<'a> BucketHelper<'a> {
 						.filter(|v| v.is_uploading(None) && v.timestamp < older_than)
 						.map(|v| ObjectVersion {
 							state: ObjectVersionState::Aborted,
-							uuid: v.uuid,
-							timestamp: v.timestamp,
+							..v.clone()
 						})
 						.collect::<Vec<_>>();
 					if !aborted_versions.is_empty() {

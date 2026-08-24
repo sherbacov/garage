@@ -636,6 +636,8 @@ impl Endpoint {
 				GetBucketCors,
 				PutBucketCors,
 				DeleteBucketCors,
+				PutBucketVersioning,
+				PutObjectLockConfiguration,
 			]
 		};
 		if readonly {
@@ -989,7 +991,7 @@ mod tests {
 			PUT "/?replication" => PutBucketReplication
 			PUT "/?requestPayment" => PutBucketRequestPayment
 			PUT "/?tagging" => PutBucketTagging
-			PUT "/?versioning" => PutBucketVersioning
+			OWNER_PUT "/?versioning" => PutBucketVersioning
 			OWNER_PUT "/?website" => PutBucketWebsite
 			PUT "/my-image.jpg" => PutObject
 			PUT "/Key+" => PutObject
@@ -997,7 +999,7 @@ mod tests {
 			PUT "/my-image.jpg?acl&versionId=3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nrjfkd" => PutObjectAcl
 			PUT "/{Key+}?acl&versionId=VersionId" => PutObjectAcl
 			PUT "/{Key+}?legal-hold&versionId=VersionId" => PutObjectLegalHold
-			PUT "/?object-lock" => PutObjectLockConfiguration
+			OWNER_PUT "/?object-lock" => PutObjectLockConfiguration
 			PUT "/{Key+}?retention&versionId=VersionId" => PutObjectRetention
 			PUT "/object-key?tagging" => PutObjectTagging
 			PUT "/{Key+}?tagging&versionId=VersionId" => PutObjectTagging

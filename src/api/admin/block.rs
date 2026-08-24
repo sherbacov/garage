@@ -264,16 +264,36 @@ async fn handle_block_purge_version_backlink(
 		let ov = object.versions().iter().rev().find(|v| v.is_complete());
 		if let Some(ov) = ov {
 			if ov.uuid == ov_id {
+				// Object Lock protects a version even from a cluster
+				// administrator: purging the blocks of a locked version would
+				// destroy data that the bucket promised to keep.
+				let protection = ov.delete_protection(now_msec());
+				if protection.is_protected() {
+					return Err(Error::bad_request(format!(
+						"Version {} of object {} in bucket {:?} is protected by Object Lock ({:?}) and cannot be purged",
+						hex::encode(ov.uuid),
+						key,
+						bucket_id,
+						protection,
+					)));
+				}
+
 				let del_uuid = gen_uuid();
-				let deleted_object = Object::new(
-					bucket_id,
-					key,
-					vec![ObjectVersion {
-						uuid: del_uuid,
-						timestamp: ov.timestamp + 1,
-						state: ObjectVersionState::Complete(ObjectVersionData::DeleteMarker),
-					}],
-				);
+				let mut versions = vec![ObjectVersion::new(
+					del_uuid,
+					ov.timestamp + 1,
+					ov.kind,
+					ObjectVersionState::Complete(ObjectVersionData::DeleteMarker),
+				)];
+				// On a versioned bucket, a delete marker alone would keep the
+				// broken version around, so it is permanently deleted as well.
+				if ov.kind == ObjectVersionKind::Versioned {
+					versions.push(ObjectVersion {
+						state: ObjectVersionState::Aborted,
+						..ov.clone()
+					});
+				}
+				let deleted_object = Object::new(bucket_id, key, versions);
 				garage.object_table.insert(&deleted_object).await?;
 				*obj_dels += 1;
 			}

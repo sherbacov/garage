@@ -49,6 +49,7 @@ enum State {
 		pos: Vec<u8>,
 		counter: usize,
 		objects_expired: usize,
+		versions_expired: usize,
 		mpu_aborted: usize,
 		last_bucket: Option<Bucket>,
 	},
@@ -101,6 +102,7 @@ impl State {
 			pos: vec![],
 			counter: 0,
 			objects_expired: 0,
+			versions_expired: 0,
 			mpu_aborted: 0,
 			last_bucket: None,
 		}
@@ -154,6 +156,7 @@ impl Worker for LifecycleWorker {
 				date,
 				counter,
 				objects_expired,
+				versions_expired,
 				mpu_aborted,
 				pos,
 				last_bucket,
@@ -168,7 +171,7 @@ impl Worker for LifecycleWorker {
 						.get_gt(&pos)?
 					{
 						None => {
-							info!("Lifecycle worker finished for {}, objects expired: {}, mpu aborted: {}", date, *objects_expired, *mpu_aborted);
+							info!("Lifecycle worker finished for {}, objects expired: {}, noncurrent versions expired: {}, mpu aborted: {}", date, *objects_expired, *versions_expired, *mpu_aborted);
 							self.persister
 								.set_with(|x| x.last_completed = Some(date.to_string()))?;
 							self.state = State::Completed(*date);
@@ -183,6 +186,7 @@ impl Worker for LifecycleWorker {
 						*date,
 						&object,
 						objects_expired,
+						versions_expired,
 						mpu_aborted,
 						last_bucket,
 					)
@@ -237,13 +241,19 @@ async fn process_object(
 	now_date: NaiveDate,
 	object: &Object,
 	objects_expired: &mut usize,
+	versions_expired: &mut usize,
 	mpu_aborted: &mut usize,
 	last_bucket: &mut Option<Bucket>,
 ) -> Result<Skip, Error> {
-	if !object
-		.versions()
-		.iter()
-		.any(|x| x.is_data() || x.is_uploading(None))
+	// An object that has more than one completely uploaded version has
+	// noncurrent versions that a lifecycle rule may expire, even when none of
+	// them holds data any more.
+	let has_noncurrent_versions = object.versions().iter().filter(|v| v.is_complete()).count() > 1;
+	if !has_noncurrent_versions
+		&& !object
+			.versions()
+			.iter()
+			.any(|x| x.is_data() || x.is_uploading(None))
 	{
 		return Ok(Skip::NextObject);
 	}
@@ -274,6 +284,11 @@ async fn process_object(
 		.and_then(|s| s.lifecycle_config.get().inner().map(|x| &x[..]))
 		.unwrap_or_default();
 
+	let versioning = bucket
+		.params()
+		.map(|s| s.versioning())
+		.unwrap_or(VersioningState::Disabled);
+
 	if lifecycle_policy.iter().all(|x| !x.enabled) {
 		return Ok(Skip::SkipBucket);
 	}
@@ -292,7 +307,7 @@ async fn process_object(
 		}
 
 		if let Some(expire) = &rule.expiration {
-			if let Some(current_version) = object.versions().iter().rev().find(|v| v.is_data()) {
+			if let Some(current_version) = object.current_version().filter(|v| v.is_data()) {
 				let version_date = next_date(current_version.timestamp);
 
 				let current_version_data = match &current_version.state {
@@ -320,11 +335,12 @@ async fn process_object(
 					let deleted_object = Object::new(
 						object.bucket_id,
 						object.key.clone(),
-						vec![ObjectVersion {
-							uuid: gen_uuid(),
-							timestamp: std::cmp::max(now_msec(), current_version.timestamp + 1),
-							state: ObjectVersionState::Complete(ObjectVersionData::DeleteMarker),
-						}],
+						vec![ObjectVersion::new(
+							gen_uuid(),
+							std::cmp::max(now_msec(), current_version.timestamp + 1),
+							ObjectVersionKind::for_versioning_state(versioning),
+							ObjectVersionState::Complete(ObjectVersionData::DeleteMarker),
+						)],
 					);
 					info!(
 						"Lifecycle: expiring 1 object in bucket {:?}",
@@ -333,6 +349,29 @@ async fn process_object(
 					db.transaction(|tx| garage.object_table.queue_insert(tx, &deleted_object))?;
 					*objects_expired += 1;
 				}
+			}
+		}
+
+		if let Some(nv_exp) = &rule.noncurrent_version_expiration {
+			let expired_versions =
+				expired_noncurrent_versions(object, &rule.filter, nv_exp, now_date, now_msec())
+					.into_iter()
+					.map(|v| ObjectVersion {
+						state: ObjectVersionState::Aborted,
+						..v.clone()
+					})
+					.collect::<Vec<_>>();
+
+			if !expired_versions.is_empty() {
+				let n_expired = expired_versions.len();
+				info!(
+					"Lifecycle: expiring {} noncurrent version(s) in bucket {:?}",
+					n_expired, object.bucket_id
+				);
+				let expired_object =
+					Object::new(object.bucket_id, object.key.clone(), expired_versions);
+				db.transaction(|tx| garage.object_table.queue_insert(tx, &expired_object))?;
+				*versions_expired += n_expired;
 			}
 		}
 
@@ -347,7 +386,7 @@ async fn process_object(
 					{
 						Some(ObjectVersion {
 							state: ObjectVersionState::Aborted,
-							..*v
+							..v.clone()
 						})
 					} else {
 						None
@@ -392,6 +431,71 @@ fn check_size_filter(version_data: &ObjectVersionData, filter: &LifecycleFilter)
 	true
 }
 
+/// The versions of an object that a `NoncurrentVersionExpiration` rule expires
+///
+/// The versions of an object are sorted from oldest to newest, and the last
+/// completely uploaded one is its current version, which such a rule never
+/// touches. Each of the others became noncurrent when the version that follows
+/// it was written, which is the date the rule counts from.
+fn expired_noncurrent_versions<'a>(
+	object: &'a Object,
+	filter: &LifecycleFilter,
+	nv_exp: &NoncurrentVersionExpiration,
+	now_date: NaiveDate,
+	now_ms: u64,
+) -> Vec<&'a ObjectVersion> {
+	let complete = object
+		.versions()
+		.iter()
+		.filter(|v| v.is_complete())
+		.collect::<Vec<_>>();
+	let n_noncurrent = complete.len().saturating_sub(1);
+
+	let mut expired = Vec::new();
+	for (i, version) in complete.iter().take(n_noncurrent).enumerate() {
+		// Keep the most recent noncurrent versions if the rule says to
+		if let Some(keep) = nv_exp.newer_noncurrent_versions {
+			if n_noncurrent - 1 - i < keep {
+				continue;
+			}
+		}
+
+		if !check_version_size_filter(version, filter) {
+			continue;
+		}
+
+		let noncurrent_date = next_date(complete[i + 1].timestamp);
+		if (now_date - noncurrent_date) < chrono::Duration::days(nv_exp.noncurrent_days as i64) {
+			continue;
+		}
+
+		// Object Lock protects a version even against the bucket's own
+		// lifecycle rules
+		if version.delete_protection(now_ms).is_protected() {
+			continue;
+		}
+
+		expired.push(*version);
+	}
+	expired
+}
+
+/// Does a version match the size conditions of a lifecycle filter
+///
+/// A delete marker holds no data and so has no size: it only matches a filter
+/// that has no size condition at all.
+fn check_version_size_filter(version: &ObjectVersion, filter: &LifecycleFilter) -> bool {
+	match &version.state {
+		ObjectVersionState::Complete(data) => match data {
+			ObjectVersionData::Inline(_, _) | ObjectVersionData::FirstBlock(_, _) => {
+				check_size_filter(data, filter)
+			}
+			ObjectVersionData::DeleteMarker => filter.size_gt.is_none() && filter.size_lt.is_none(),
+		},
+		_ => false,
+	}
+}
+
 fn midnight_ts(date: NaiveDate, use_local_tz: bool) -> u64 {
 	let midnight = date.and_hms_opt(0, 0, 0).expect("midnight does not exist");
 	if use_local_tz {
@@ -417,4 +521,204 @@ fn today(use_local_tz: bool) -> NaiveDate {
 		return Local::now().naive_local().date();
 	}
 	Utc::now().naive_utc().date()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use garage_util::data::Uuid;
+
+	const DAY_MS: u64 = 24 * 3600 * 1000;
+
+	fn uuid(n: u8) -> Uuid {
+		Uuid::from([n; 32])
+	}
+
+	/// A date far enough from the epoch that we can place versions before it
+	fn today() -> NaiveDate {
+		NaiveDate::from_ymd_opt(2026, 1, 31).unwrap()
+	}
+
+	fn now_ms() -> u64 {
+		midnight_ts(today(), false)
+	}
+
+	/// A version created `days_ago` days before `today()`
+	fn version(n: u8, days_ago: u64, size: u64) -> ObjectVersion {
+		ObjectVersion::new(
+			uuid(n),
+			now_ms() - days_ago * DAY_MS,
+			ObjectVersionKind::Versioned,
+			ObjectVersionState::Complete(ObjectVersionData::Inline(
+				ObjectVersionMeta {
+					size,
+					etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+					encryption: ObjectVersionEncryption::Plaintext {
+						inner: ObjectVersionMetaInner {
+							headers: vec![],
+							checksum: None,
+							checksum_type: None,
+						},
+					},
+				},
+				vec![],
+			)),
+		)
+	}
+
+	fn delete_marker(n: u8, days_ago: u64) -> ObjectVersion {
+		ObjectVersion::new(
+			uuid(n),
+			now_ms() - days_ago * DAY_MS,
+			ObjectVersionKind::Versioned,
+			ObjectVersionState::Complete(ObjectVersionData::DeleteMarker),
+		)
+	}
+
+	fn object(versions: Vec<ObjectVersion>) -> Object {
+		Object::new(uuid(0xff), "the/key".into(), versions)
+	}
+
+	fn expire(
+		object: &Object,
+		nv_exp: &NoncurrentVersionExpiration,
+		filter: &LifecycleFilter,
+	) -> Vec<Uuid> {
+		expired_noncurrent_versions(object, filter, nv_exp, today(), now_ms())
+			.into_iter()
+			.map(|v| v.uuid)
+			.collect()
+	}
+
+	fn after(days: usize) -> NoncurrentVersionExpiration {
+		NoncurrentVersionExpiration {
+			noncurrent_days: days,
+			newer_noncurrent_versions: None,
+		}
+	}
+
+	#[test]
+	fn the_current_version_never_expires() {
+		// A single version is the current one, however old it is
+		let obj = object(vec![version(1, 100, 10)]);
+		assert!(expire(&obj, &after(1), &LifecycleFilter::default()).is_empty());
+	}
+
+	#[test]
+	fn noncurrent_versions_expire_from_the_day_they_stopped_being_current() {
+		// v1 became noncurrent when v2 was written 10 days ago, v2 became
+		// noncurrent when v3 was written 3 days ago, v3 is current. As for
+		// `Expiration`, the days are counted from the midnight that follows the
+		// day a version became noncurrent, so v1 has been noncurrent for 9 days
+		// and v2 for 2 days.
+		let obj = object(vec![
+			version(1, 30, 10),
+			version(2, 10, 10),
+			version(3, 3, 10),
+		]);
+
+		// After 10 days, nothing has been noncurrent for long enough
+		assert!(expire(&obj, &after(10), &LifecycleFilter::default()).is_empty());
+
+		// After 9 days, only v1 has
+		assert_eq!(
+			expire(&obj, &after(9), &LifecycleFilter::default()),
+			vec![uuid(1)]
+		);
+
+		// After 2 days, both noncurrent versions have
+		assert_eq!(
+			expire(&obj, &after(2), &LifecycleFilter::default()),
+			vec![uuid(1), uuid(2)]
+		);
+	}
+
+	#[test]
+	fn the_most_recent_noncurrent_versions_can_be_kept() {
+		let obj = object(vec![
+			version(1, 40, 10),
+			version(2, 30, 10),
+			version(3, 20, 10),
+			version(4, 10, 10),
+		]);
+		let nv_exp = NoncurrentVersionExpiration {
+			noncurrent_days: 1,
+			newer_noncurrent_versions: Some(2),
+		};
+		// v1, v2 and v3 are noncurrent; the two most recent of them are kept
+		assert_eq!(
+			expire(&obj, &nv_exp, &LifecycleFilter::default()),
+			vec![uuid(1)]
+		);
+	}
+
+	#[test]
+	fn locked_versions_are_never_expired() {
+		let mut locked = version(1, 30, 10);
+		locked.retention.update(Some(Retention {
+			mode: ObjectLockMode::Compliance,
+			retain_until: now_ms() + DAY_MS,
+		}));
+		let mut held = version(2, 30, 10);
+		held.legal_hold.update(true);
+
+		let obj = object(vec![locked, held, version(3, 20, 10), version(4, 5, 10)]);
+		assert_eq!(
+			expire(&obj, &after(1), &LifecycleFilter::default()),
+			vec![uuid(3)]
+		);
+	}
+
+	#[test]
+	fn noncurrent_delete_markers_expire_too() {
+		let obj = object(vec![delete_marker(1, 30), version(2, 20, 10)]);
+		assert_eq!(
+			expire(&obj, &after(1), &LifecycleFilter::default()),
+			vec![uuid(1)]
+		);
+	}
+
+	#[test]
+	fn a_size_filter_leaves_delete_markers_alone() {
+		let filter = LifecycleFilter {
+			size_gt: Some(5),
+			..Default::default()
+		};
+		// The delete marker has no size, so a rule with a size condition does
+		// not apply to it; the small version does not match it either.
+		let obj = object(vec![
+			delete_marker(1, 30),
+			version(2, 25, 1),
+			version(3, 20, 100),
+			version(4, 5, 10),
+		]);
+		assert_eq!(expire(&obj, &after(1), &filter), vec![uuid(3)]);
+	}
+
+	#[test]
+	fn uploads_in_progress_are_not_noncurrent_versions() {
+		let uploading = ObjectVersion::new(
+			uuid(2),
+			now_ms() - 30 * DAY_MS,
+			ObjectVersionKind::Versioned,
+			ObjectVersionState::Uploading {
+				multipart: true,
+				checksum_algorithm: None,
+				encryption: ObjectVersionEncryption::Plaintext {
+					inner: ObjectVersionMetaInner {
+						headers: vec![],
+						checksum: None,
+						checksum_type: None,
+					},
+				},
+			},
+		);
+		let obj = object(vec![version(1, 40, 10), uploading, version(3, 20, 10)]);
+		// Only v1 is a noncurrent version: the upload is not a version yet
+		assert_eq!(
+			expire(&obj, &after(1), &LifecycleFilter::default()),
+			vec![uuid(1)]
+		);
+	}
 }

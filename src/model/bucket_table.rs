@@ -245,10 +245,231 @@ mod v2 {
 	}
 }
 
-pub use v2::*;
+mod v3 {
+	use crate::permission::BucketKeyPerm;
+	use crate::s3::object_table::v3::ObjectLockMode;
+	use garage_util::crdt;
+	use garage_util::data::Uuid;
+	use serde::{Deserialize, Serialize};
+
+	use super::v2;
+
+	pub use v2::{
+		BucketQuotas, CorsRule, LifecycleExpiration, LifecycleFilter, Redirect, RedirectAll,
+		RedirectCondition, RoutingRule, WebsiteConfig,
+	};
+
+	#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+	pub struct Bucket {
+		/// ID of the bucket
+		pub id: Uuid,
+		/// State, and configuration if not deleted, of the bucket
+		pub state: crdt::Deletable<BucketParams>,
+	}
+
+	/// Configuration for a bucket
+	#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub struct BucketParams {
+		/// Bucket's creation date
+		pub creation_date: u64,
+		/// Map of key with access to the bucket, and what kind of access they give
+		pub authorized_keys: crdt::Map<String, BucketKeyPerm>,
+
+		/// Map of aliases that are or have been given to this bucket
+		/// in the global namespace
+		/// (not authoritative: this is just used as an indication to
+		/// map back to aliases when doing `ListBuckets`)
+		pub aliases: crdt::LwwMap<String, bool>,
+		/// Map of aliases that are or have been given to this bucket
+		/// in namespaces local to keys
+		/// key = (access key id, alias name)
+		pub local_aliases: crdt::LwwMap<(String, String), bool>,
+
+		/// Whether this bucket is allowed for website access
+		/// (under all of its global alias names),
+		/// and if so, the website configuration XML document
+		pub website_config: crdt::Lww<crdt::CancelingOption<WebsiteConfig>>,
+		/// CORS rules
+		pub cors_config: crdt::Lww<crdt::CancelingOption<Vec<CorsRule>>>,
+		/// Lifecycle configuration
+		pub lifecycle_config: crdt::Lww<crdt::CancelingOption<Vec<LifecycleRule>>>,
+		/// Bucket quotas
+		pub quotas: crdt::Lww<BucketQuotas>,
+		/// Whether object versioning is enabled on this bucket
+		pub versioning: crdt::Lww<VersioningState>,
+		/// Object Lock configuration, if Object Lock is enabled on this bucket
+		pub object_lock: crdt::Lww<crdt::CancelingOption<ObjectLockConfig>>,
+	}
+
+	/// Lifecycle configuration rule
+	#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub struct LifecycleRule {
+		/// The ID of the rule
+		pub id: Option<String>,
+		/// Whether the rule is active
+		pub enabled: bool,
+		/// The filter to check whether rule applies to a given object
+		pub filter: LifecycleFilter,
+		/// Number of days after which incomplete multipart uploads are aborted
+		pub abort_incomplete_mpu_days: Option<usize>,
+		/// Expiration policy for the current version of stored objects
+		pub expiration: Option<LifecycleExpiration>,
+		/// Expiration policy for the versions of an object that are not its
+		/// current version any more
+		pub noncurrent_version_expiration: Option<NoncurrentVersionExpiration>,
+	}
+
+	/// Expiration policy for the versions of an object that are not its current
+	/// version any more
+	///
+	/// A version becomes noncurrent when a newer version of the object is
+	/// written, and is permanently deleted `noncurrent_days` days after that.
+	#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub struct NoncurrentVersionExpiration {
+		/// Number of days after a version stopped being the current one after
+		/// which it is permanently deleted
+		pub noncurrent_days: usize,
+		/// If set, that many of the most recent noncurrent versions are kept
+		/// whatever their age
+		pub newer_noncurrent_versions: Option<usize>,
+	}
+
+	/// The versioning state of a bucket
+	///
+	/// Once versioning has been enabled on a bucket, it can never go back to
+	/// `Disabled`: it can only be `Suspended`, which stops the creation of new
+	/// versions but keeps the versions that already exist.
+	#[derive(
+		Default, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize,
+	)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub enum VersioningState {
+		/// Versioning was never enabled on this bucket: objects have no
+		/// version id and writing an object overwrites the previous one
+		#[default]
+		Disabled,
+		/// Each write creates a new version of the object, and versions are
+		/// kept until they are explicitly deleted
+		Enabled,
+		/// Versioning was enabled and then suspended: versions that were
+		/// created while it was enabled are kept, but new writes overwrite
+		/// the object's `null` version
+		Suspended,
+	}
+
+	/// Object Lock configuration of a bucket
+	///
+	/// Object Lock can only be turned on when the bucket is created, and can
+	/// never be turned off afterwards. A bucket that has Object Lock enabled
+	/// always has versioning enabled as well.
+	#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub struct ObjectLockConfig {
+		/// Retention settings applied to new object versions when the request
+		/// that creates them does not specify any
+		pub default_retention: Option<DefaultRetention>,
+	}
+
+	/// Default Object Lock retention settings of a bucket
+	#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub struct DefaultRetention {
+		pub mode: ObjectLockMode,
+		pub duration: RetentionDuration,
+	}
+
+	/// How long a new object version is retained under the bucket's default
+	/// Object Lock retention settings
+	#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Serialize, Deserialize)]
+	#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+	pub enum RetentionDuration {
+		Days(u64),
+		Years(u64),
+	}
+
+	fn migrate_lifecycle_rule(old: v2::LifecycleRule) -> LifecycleRule {
+		LifecycleRule {
+			id: old.id,
+			enabled: old.enabled,
+			filter: old.filter,
+			abort_incomplete_mpu_days: old.abort_incomplete_mpu_days,
+			expiration: old.expiration,
+			// Rules that predate versioning support cannot expire noncurrent
+			// versions, as there were none
+			noncurrent_version_expiration: None,
+		}
+	}
+
+	impl garage_util::migrate::Migrate for Bucket {
+		const VERSION_MARKER: &'static [u8] = b"G3bkt";
+
+		type Previous = v2::Bucket;
+
+		fn migrate(old: v2::Bucket) -> Bucket {
+			Bucket {
+				id: old.id,
+				state: old.state.map(|x| BucketParams {
+					creation_date: x.creation_date,
+					authorized_keys: x.authorized_keys,
+					aliases: x.aliases,
+					local_aliases: x.local_aliases,
+					website_config: x.website_config,
+					cors_config: x.cors_config,
+					lifecycle_config: x.lifecycle_config.map(|lc| {
+						lc.map(|rules| rules.into_iter().map(migrate_lifecycle_rule).collect())
+					}),
+					quotas: x.quotas,
+					// Buckets that predate versioning support have never had
+					// versioning nor Object Lock enabled
+					versioning: crdt::Lww::raw(x.creation_date, VersioningState::Disabled),
+					object_lock: crdt::Lww::raw(x.creation_date, None.into()),
+				}),
+			}
+		}
+	}
+}
+
+pub use v3::*;
 
 impl AutoCrdt for BucketQuotas {
 	const WARN_IF_DIFFERENT: bool = true;
+}
+
+impl AutoCrdt for VersioningState {
+	const WARN_IF_DIFFERENT: bool = true;
+}
+
+impl BucketParams {
+	/// The versioning state of this bucket
+	pub fn versioning(&self) -> VersioningState {
+		*self.versioning.get()
+	}
+
+	/// Whether new writes to this bucket must create a new retained version
+	pub fn is_versioning_enabled(&self) -> bool {
+		self.versioning() == VersioningState::Enabled
+	}
+
+	/// The Object Lock configuration of this bucket, if Object Lock is enabled
+	pub fn object_lock(&self) -> Option<&ObjectLockConfig> {
+		self.object_lock.get().inner()
+	}
+}
+
+impl RetentionDuration {
+	/// The number of milliseconds this duration represents.
+	///
+	/// As in AWS S3, a year is counted as 365 days.
+	pub fn as_msec(&self) -> u64 {
+		const DAY_MSEC: u64 = 24 * 3600 * 1000;
+		match self {
+			Self::Days(d) => d.saturating_mul(DAY_MSEC),
+			Self::Years(y) => y.saturating_mul(365).saturating_mul(DAY_MSEC),
+		}
+	}
 }
 
 impl BucketParams {
@@ -263,6 +484,8 @@ impl BucketParams {
 			cors_config: crdt::Lww::new(None.into()),
 			lifecycle_config: crdt::Lww::new(None.into()),
 			quotas: crdt::Lww::new(BucketQuotas::default()),
+			versioning: crdt::Lww::new(VersioningState::Disabled),
+			object_lock: crdt::Lww::new(None.into()),
 		}
 	}
 }
@@ -279,6 +502,8 @@ impl Crdt for BucketParams {
 		self.cors_config.merge(&o.cors_config);
 		self.lifecycle_config.merge(&o.lifecycle_config);
 		self.quotas.merge(&o.quotas);
+		self.versioning.merge(&o.versioning);
+		self.object_lock.merge(&o.object_lock);
 	}
 }
 

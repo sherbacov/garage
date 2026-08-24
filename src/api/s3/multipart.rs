@@ -27,7 +27,9 @@ use garage_api_common::signature::checksum::*;
 use crate::api_server::{ReqBody, ResBody};
 use crate::encryption::{has_encryption_header, EncryptionParams, OekDerivationInfo};
 use crate::error::*;
+use crate::object_lock::object_lock_from_headers;
 use crate::put::*;
+use crate::versioning::{response_version_id, X_AMZ_VERSION_ID};
 use crate::xml as s3_xml;
 
 // ----
@@ -72,16 +74,21 @@ pub async fn handle_create_multipart_upload(
 		request_checksum_algorithm(req.headers())?,
 	)?;
 
-	// Create object in object table
-	let object_version = ObjectVersion {
-		uuid: upload_id,
+	// Create object in object table. The Object Lock settings of the upload are
+	// those of the request that starts it: the version it creates gets them when
+	// the upload completes.
+	let object_lock = object_lock_from_headers(&ctx.bucket_params, req.headers())?;
+	let mut object_version = ObjectVersion::new(
+		upload_id,
 		timestamp,
-		state: ObjectVersionState::Uploading {
+		ObjectVersionKind::for_versioning_state(ctx.bucket_params.versioning()),
+		ObjectVersionState::Uploading {
 			multipart: true,
 			encryption: object_encryption,
 			checksum_algorithm,
 		},
-	};
+	);
+	object_lock.apply(&mut object_version);
 	let object = Object::new(*bucket_id, key.to_string(), vec![object_version]);
 	garage.object_table.insert(&object).await?;
 
@@ -526,7 +533,10 @@ pub async fn handle_complete_multipart_upload(
 	};
 	let xml = s3_xml::to_xml_with_header(&result)?;
 
-	let resp = Response::builder();
+	let resp = Response::builder().header(
+		X_AMZ_VERSION_ID,
+		response_version_id(&ctx.bucket_params, upload_id),
+	);
 	let resp = add_checksum_response_headers(&expected_checksum, resp);
 	Ok(resp.body(string_body(xml))?)
 }

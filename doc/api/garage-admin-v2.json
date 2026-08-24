@@ -1766,6 +1766,70 @@
           }
         }
       },
+      "ApiBucketVersioning": {
+        "type": "string",
+        "description": "The versioning state of a bucket",
+        "enum": [
+          "Disabled",
+          "Enabled",
+          "Suspended"
+        ]
+      },
+      "ApiDefaultRetention": {
+        "type": "object",
+        "description": "Default Object Lock retention settings of a bucket",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Retention period in days; exactly one of `days` and `years` must be set",
+            "minimum": 0
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ApiObjectLockMode"
+          },
+          "years": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Retention period in years; exactly one of `days` and `years` must be set",
+            "minimum": 0
+          }
+        }
+      },
+      "ApiObjectLockConfig": {
+        "type": "object",
+        "description": "The Object Lock configuration of a bucket",
+        "properties": {
+          "defaultRetention": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiDefaultRetention",
+                "description": "Retention applied to new object versions when the request that creates\nthem does not specify any"
+              }
+            ]
+          }
+        }
+      },
+      "ApiObjectLockMode": {
+        "type": "string",
+        "description": "The mode of an Object Lock retention setting",
+        "enum": [
+          "Governance",
+          "Compliance"
+        ]
+      },
       "ApplyClusterLayoutRequest": {
         "type": "object",
         "required": [
@@ -2568,6 +2632,17 @@
             },
             "description": "Object lifecycle rules for this bucket"
           },
+          "objectLock": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiObjectLockConfig",
+                "description": "Object Lock configuration of this bucket, if Object Lock is enabled"
+              }
+            ]
+          },
           "objects": {
             "type": "integer",
             "format": "int64",
@@ -2596,6 +2671,10 @@
             "type": "integer",
             "format": "int64",
             "description": "Number of unfinished uploads in this bucket"
+          },
+          "versioning": {
+            "$ref": "#/components/schemas/ApiBucketVersioning",
+            "description": "Whether object versioning is enabled on this bucket"
           },
           "websiteAccess": {
             "type": "boolean",
@@ -3010,6 +3089,24 @@
           }
         }
       },
+      "InspectObjectRetention": {
+        "type": "object",
+        "description": "The Object Lock retention setting of an object version",
+        "required": [
+          "mode",
+          "retainUntil"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/ApiObjectLockMode"
+          },
+          "retainUntil": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Date until which this version is retained"
+          }
+        }
+      },
       "InspectObjectVersion": {
         "type": "object",
         "required": [
@@ -3067,6 +3164,25 @@
           "inline": {
             "type": "boolean",
             "description": "Whether the object's data is stored inline (for small objects)"
+          },
+          "legalHold": {
+            "type": "boolean",
+            "description": "Whether this version is under an Object Lock legal hold"
+          },
+          "retention": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InspectObjectRetention",
+                "description": "Object Lock retention setting of this version, if it has one"
+              }
+            ]
+          },
+          "s3VersionId": {
+            "type": "string",
+            "description": "The S3 version id of this version: `null` for the versions written\nwhile bucket versioning was disabled or suspended"
           },
           "size": {
             "type": [
@@ -4564,6 +4680,17 @@
               "$ref": "#/components/schemas/lifecycle.Rule"
             }
           },
+          "objectLock": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiObjectLockConfig",
+                "description": "Turn Object Lock on for this bucket and set its configuration.\nObject Lock can never be turned off once it is on."
+              }
+            ]
+          },
           "quotas": {
             "oneOf": [
               {
@@ -4571,6 +4698,16 @@
               },
               {
                 "$ref": "#/components/schemas/ApiBucketQuotas"
+              }
+            ]
+          },
+          "versioning": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiBucketVersioning"
               }
             ]
           },
@@ -4959,6 +5096,28 @@
           "Prefix": {}
         }
       },
+      "lifecycle.NoncurrentVersionExpiration": {
+        "type": "object",
+        "description": "Expiration of the versions of an object that are not its current version\nany more, which only ever exist on a bucket that has versioning enabled",
+        "required": [
+          "NoncurrentDays"
+        ],
+        "properties": {
+          "NewerNoncurrentVersions": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/xml.IntValue"
+              }
+            ]
+          },
+          "NoncurrentDays": {
+            "$ref": "#/components/schemas/xml.IntValue"
+          }
+        }
+      },
       "lifecycle.Rule": {
         "type": "object",
         "required": [
@@ -4996,6 +5155,16 @@
             ]
           },
           "ID": {},
+          "NoncurrentVersionExpiration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/lifecycle.NoncurrentVersionExpiration"
+              }
+            ]
+          },
           "Status": {}
         }
       },

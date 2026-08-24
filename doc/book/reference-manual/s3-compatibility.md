@@ -33,7 +33,8 @@ Feel free to open a PR to suggest fixes this table. Minio is missing because the
 | [URL vhost-style](https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#virtual-hosted-style-access) URL (eg. `bucket.host.tld/key`) |  ✅ Implemented | ❌| ✅| ✅ | ✅ |
 | [Presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html) |  ✅ Implemented | ❌|  ✅ | ✅ |  ✅(❓) |
 | [SSE-C encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerSideEncryptionCustomerKeys.html) |  ✅ Implemented | ❓ |  ✅ | ❌ |  ✅ |
-| [Bucket versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) | ❌ Missing | ✅ |  ✅ | ❌ | ✅ |
+| [Bucket versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) | ✅ Implemented | ✅ |  ✅ | ❌ | ✅ |
+| [Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html) | ✅ Implemented | ❌ |  ✅ | ❌ | ❌ |
 
 *Note:* OpenIO does not says if it supports presigned URLs. Because it is part
 of signature v4 and they claim they support it without additional precisions,
@@ -120,27 +121,42 @@ See Garage CLI reference manual to learn how to use Garage's permission system.
 
 ### Versioning, Lifecycle endpoints
 
-Garage does not (yet) support object versioning.
-If you need this feature, please [share your use case in our dedicated issue](https://git.deuxfleurs.fr/Deuxfleurs/garage/issues/166).
-
 | Endpoint                     | Garage                           | [Openstack Swift](https://docs.openstack.org/swift/latest/s3_compat.html) | [Ceph Object Gateway](https://docs.ceph.com/en/latest/radosgw/s3/) | [Riak CS](https://docs.riak.com/riak/cs/2.1.1/references/apis/storage/s3/index.html) | [OpenIO](https://docs.openio.io/latest/source/arch-design/s3_compliancy.html) |
 |------------------------------|----------------------------------|-----------------|---------------|---------|-----|
 | [DeleteBucketLifecycle](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketLifecycle.html) | ✅ Implemented | ❌| ✅| ❌| ✅|
 | [GetBucketLifecycleConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLifecycleConfiguration.html) | ✅ Implemented | ❌| ✅ | ❌| ✅|
 | [PutBucketLifecycleConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html) | ⚠ Partially implemented (see below) | ❌| ✅ | ❌| ✅|
-| [GetBucketVersioning](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html)          | ❌ Stub (see below)       | ✅| ✅ | ❌| ✅|
-| [ListObjectVersions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html) | ❌ Missing | ❌| ✅ | ❌| ✅|
-| [PutBucketVersioning](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketVersioning.html) | ❌ Missing | ❌| ✅| ❌| ✅|
+| [GetBucketVersioning](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html)          | ✅ Implemented       | ✅| ✅ | ❌| ✅|
+| [ListObjectVersions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectVersions.html) | ⚠ Partially implemented (see below) | ❌| ✅ | ❌| ✅|
+| [PutBucketVersioning](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketVersioning.html) | ⚠ Partially implemented (see below) | ❌| ✅| ❌| ✅|
 
-**PutBucketLifecycleConfiguration:** The only actions supported are
-`AbortIncompleteMultipartUpload` and `Expiration` (without the
-`ExpiredObjectDeleteMarker` field).  All other operations are dependent on
-either bucket versioning or storage classes which Garage currently does not
-implement. The deprecated `Prefix` member directly in the the `Rule`
-structure/XML tag is not supported, specified prefixes must be inside the
-`Filter` structure/XML tag.
+**PutBucketLifecycleConfiguration:** The supported actions are
+`AbortIncompleteMultipartUpload`, `Expiration` (without the
+`ExpiredObjectDeleteMarker` field) and `NoncurrentVersionExpiration` (with both
+`NoncurrentDays` and `NewerNoncurrentVersions`). `NoncurrentVersionTransition`
+and the remaining actions depend on storage classes, which Garage does not
+implement. On a versioned bucket, `Expiration` adds a delete marker rather than
+deleting the data, as the S3 API specifies, while `NoncurrentVersionExpiration`
+permanently deletes the versions it applies to, except the ones that Object
+Lock protects, which it leaves alone. As for `Expiration`, the days are counted
+from the midnight that follows the day a version became noncurrent, i.e. the day
+the version that replaced it was written. The deprecated `Prefix` member directly
+in the the `Rule` structure/XML tag is not supported, specified prefixes must be
+inside the `Filter` structure/XML tag.
 
-**GetBucketVersioning:** Stub implementation which always returns "versioning not enabled", since Garage does not yet support bucket versioning.
+**PutBucketVersioning:** MFA delete is not supported: a request that asks for
+`MfaDelete` to be `Enabled` is rejected. As it changes how a bucket stores its
+data, enabling or suspending versioning requires the `owner` permission on the
+bucket, like the other bucket configuration endpoints.
+
+**ListObjectVersions:** Unlike AWS S3, Garage does not interleave the `Version`
+and `DeleteMarker` elements of the response: all versions come first, then all
+delete markers. Both lists are individually sorted as the S3 API requires, which
+is what SDKs that expose them as two separate lists (such as boto3) rely on.
+The `Owner` element is not returned, as Garage does not implement object
+ownership.
+
+**Bucket versioning:** see the dedicated section below.
 
 ### Replication endpoints
 
@@ -157,18 +173,99 @@ Please open an issue if you have a use case for replication.
 but with some limitations.
 Additionally, replication endpoints are not documented in the S3 compatibility page so I don't know what kind of support we can expect.*
 
+### Bucket versioning
+
+Versioning is enabled per bucket, either with `PutBucketVersioning` or with
+`garage bucket versioning --enable <bucket>`. Once enabled, it can only be
+suspended, never disabled: the versions that were created while it was enabled
+are kept until they are explicitly deleted.
+
+When versioning is **enabled**, every write to a key creates a new version with
+its own version id, and deleting a key adds a delete marker instead of removing
+the data. Previous versions remain readable through `GetObject` with a
+`versionId` parameter, and are listed by `ListObjectVersions`. Deleting a
+specific version with `DELETE /key?versionId=...` removes it permanently and
+frees the blocks it references.
+
+When versioning is **suspended**, writes go to the object's `null` version,
+which each write replaces, while the versions created while versioning was
+enabled are kept.
+
+Two behaviours differ from AWS S3, for backwards compatibility with the
+versions of Garage that predate versioning support:
+
+- On a bucket on which versioning was never enabled, `PutObject` keeps
+  returning Garage's internal version uuid in the `x-amz-version-id` response
+  header (AWS S3 returns no such header). On such buckets the `versionId` query
+  parameter is ignored, so that a client that sends one of those uuids back
+  keeps addressing the object rather than getting an error.
+- `DELETE /key` on a key that does not exist does not create a delete marker;
+  as in AWS S3, it is reported as a success.
+
+Noncurrent versions are kept until they are explicitly deleted, or until a
+`NoncurrentVersionExpiration` lifecycle rule expires them; see the note on
+`PutBucketLifecycleConfiguration` above.
+
+`garage bucket inspect-object <bucket> <key>` lists every version of an object
+with its S3 version id and, when it has any, its Object Lock settings.
+
+Object versions do not count as separate objects for the bucket's `max_objects`
+quota, but the data of every version is counted in the bucket size and in the
+`max_size` quota. On a bucket whose versioning is suspended, the `max_size`
+check does not deduce the `null` version that a write replaces, so it errs on
+the side of rejecting the write.
+
 ### Locking objects
 
 Amazon defines a concept of [object locking](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html) that can be achieved either through a Retention period or a Legal hold.
 
 | Endpoint                     | Garage                           | [Openstack Swift](https://docs.openstack.org/swift/latest/s3_compat.html) | [Ceph Object Gateway](https://docs.ceph.com/en/latest/radosgw/s3/) | [Riak CS](https://docs.riak.com/riak/cs/2.1.1/references/apis/storage/s3/index.html) | [OpenIO](https://docs.openio.io/latest/source/arch-design/s3_compliancy.html) |
 |------------------------------|----------------------------------|-----------------|---------------|---------|-----|
-| [GetObjectLegalHold](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectLegalHold.html) | ❌ Missing | ❌| ✅ | ❌| ❌|
-| [PutObjectLegalHold](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLegalHold.html) | ❌ Missing | ❌| ✅ | ❌| ❌|
-| [GetObjectRetention](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectRetention.html) | ❌ Missing | ❌| ✅ | ❌| ❌|
-| [PutObjectRetention](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectRetention.html) | ❌ Missing | ❌| ✅ | ❌| ❌|
-| [GetObjectLockConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectLockConfiguration.html) | ❌ Missing | ❌| ✅ | ❌| ❌|
-| [PutObjectLockConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLockConfiguration.html) | ❌ Missing | ❌| ✅ | ❌| ❌|
+| [GetObjectLegalHold](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectLegalHold.html) | ✅ Implemented | ❌| ✅ | ❌| ❌|
+| [PutObjectLegalHold](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLegalHold.html) | ✅ Implemented | ❌| ✅ | ❌| ❌|
+| [GetObjectRetention](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectRetention.html) | ✅ Implemented | ❌| ✅ | ❌| ❌|
+| [PutObjectRetention](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectRetention.html) | ✅ Implemented | ❌| ✅ | ❌| ❌|
+| [GetObjectLockConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectLockConfiguration.html) | ✅ Implemented | ❌| ✅ | ❌| ❌|
+| [PutObjectLockConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectLockConfiguration.html) | ⚠ Partially implemented (see below) | ❌| ✅ | ❌| ❌|
+
+Object Lock protects individual versions of objects, so it requires the bucket
+to have versioning enabled. It can be turned on either at bucket creation, by
+passing `x-amz-bucket-object-lock-enabled: true` to `CreateBucket` (which turns
+versioning on as well), or afterwards on a bucket whose versioning is already
+enabled, with `PutObjectLockConfiguration` or with
+`garage bucket object-lock --enable <bucket>`. It can never be turned off, and
+versioning cannot be suspended while it is on.
+
+A version is protected either by a retention period or by a legal hold:
+
+- a version under a **legal hold** cannot be deleted by anyone until the hold is
+  lifted with `PutObjectLegalHold`;
+- a version retained in **governance** mode can only be deleted, or have its
+  retention shortened or lifted, by a caller that sends
+  `x-amz-bypass-governance-retention: true`;
+- a version retained in **compliance** mode cannot be deleted before its
+  retain-until date by anyone, and its retention can only be extended. This
+  holds for cluster administrators too: `garage bucket delete` refuses to delete
+  a bucket that still holds retained versions, and `garage block purge` refuses
+  to purge a locked version.
+
+Deleting a locked version without naming it, i.e. `DELETE /key` with no
+`versionId`, adds a delete marker and is always allowed, as in AWS S3: the
+version itself is left untouched and can still be read by its version id.
+
+The default retention of the bucket, if it has one, applies to every version
+created without `x-amz-object-lock-mode` and
+`x-amz-object-lock-retain-until-date` headers.
+
+**PutObjectLockConfiguration:** Unlike AWS S3, Garage lets this endpoint turn
+Object Lock on for an existing bucket, provided its versioning is already
+enabled; AWS only allows it at bucket creation. Turning Object Lock off is never
+possible.
+
+**Bypassing governance retention:** AWS gates this on the
+`s3:BypassGovernanceRetention` permission. Garage does not implement IAM
+policies, so it requires the access key to have the `owner` permission on the
+bucket instead.
 
 ### (Server-side) encryption
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use hyper::{Request, Response, StatusCode};
 
 use garage_model::bucket_alias_table::*;
-use garage_model::bucket_table::Bucket;
+use garage_model::bucket_table::{Bucket, ObjectLockConfig, VersioningState};
 use garage_model::garage::Garage;
 use garage_model::key_table::{Key, KeyParams};
 use garage_model::permission::BucketKeyPerm;
@@ -16,6 +16,7 @@ use garage_api_common::helpers::*;
 
 use crate::api_server::{ReqBody, ResBody};
 use crate::error::*;
+use crate::object_lock::create_bucket_object_lock_enabled;
 use crate::xml as s3_xml;
 
 pub fn handle_get_bucket_location(ctx: ReqCtx) -> Result<Response<ResBody>, Error> {
@@ -25,19 +26,6 @@ pub fn handle_get_bucket_location(ctx: ReqCtx) -> Result<Response<ResBody>, Erro
 		region: garage.config.s3_api.s3_region.to_string(),
 	};
 	let xml = s3_xml::to_xml_with_header(&loc)?;
-
-	Ok(Response::builder()
-		.header("Content-Type", "application/xml")
-		.body(string_body(xml))?)
-}
-
-pub fn handle_get_bucket_versioning() -> Result<Response<ResBody>, Error> {
-	let versioning = s3_xml::VersioningConfiguration {
-		xmlns: (),
-		status: None,
-	};
-
-	let xml = s3_xml::to_xml_with_header(&versioning)?;
 
 	Ok(Response::builder()
 		.header("Content-Type", "application/xml")
@@ -171,6 +159,8 @@ pub async fn handle_create_bucket(
 	api_key_id: &String,
 	bucket_name: String,
 ) -> Result<Response<ResBody>, Error> {
+	let object_lock_enabled = create_bucket_object_lock_enabled(req.headers())?;
+
 	let body = req.into_body().collect().await?;
 
 	let cmd =
@@ -225,7 +215,19 @@ pub async fn handle_create_bucket(
 			)));
 		}
 
-		let bucket = Bucket::new();
+		let mut bucket = Bucket::new();
+		if object_lock_enabled {
+			// Object Lock protects versions of objects, so turning it on also
+			// turns versioning on, as in AWS S3.
+			let params = bucket.params_mut().unwrap();
+			params.versioning.update(VersioningState::Enabled);
+			params.object_lock.update(
+				Some(ObjectLockConfig {
+					default_retention: None,
+				})
+				.into(),
+			);
+		}
 		garage.bucket_table.insert(&bucket).await?;
 
 		helper

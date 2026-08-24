@@ -4,6 +4,7 @@ use utoipa::ToSchema;
 use garage_model::bucket_table::{
 	parse_lifecycle_date, LifecycleExpiration as GarageLifecycleExpiration,
 	LifecycleFilter as GarageLifecycleFilter, LifecycleRule as GarageLifecycleRule,
+	NoncurrentVersionExpiration as GarageNoncurrentVersionExpiration,
 };
 
 use super::{xmlns_tag, IntValue, Value};
@@ -31,6 +32,12 @@ pub struct LifecycleRule {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub expiration: Option<Expiration>,
+	#[serde(
+		rename = "NoncurrentVersionExpiration",
+		default,
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub noncurrent_version_expiration: Option<NoncurrentVersionExpiration>,
 	#[serde(
 		rename = "AbortIncompleteMultipartUpload",
 		default,
@@ -65,6 +72,21 @@ pub struct Expiration {
 	pub days: Option<IntValue>,
 	#[serde(rename = "Date", skip_serializing_if = "Option::is_none")]
 	pub at_date: Option<Value>,
+}
+
+/// Expiration of the versions of an object that are not its current version
+/// any more, which only ever exist on a bucket that has versioning enabled
+#[derive(Debug, ToSchema, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[schema(as = lifecycle::NoncurrentVersionExpiration)]
+pub struct NoncurrentVersionExpiration {
+	#[serde(rename = "NoncurrentDays")]
+	pub noncurrent_days: IntValue,
+	#[serde(
+		rename = "NewerNoncurrentVersions",
+		default,
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub newer_noncurrent_versions: Option<IntValue>,
 }
 
 #[derive(Debug, ToSchema, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -117,12 +139,18 @@ impl LifecycleRule {
 			.map(Expiration::validate_into_garage_lifecycle_expiration)
 			.transpose()?;
 
+		let noncurrent_version_expiration = self
+			.noncurrent_version_expiration
+			.map(NoncurrentVersionExpiration::validate_into_garage)
+			.transpose()?;
+
 		Ok(GarageLifecycleRule {
 			id: self.id.map(|x| x.0),
 			enabled,
 			filter,
 			abort_incomplete_mpu_days,
 			expiration,
+			noncurrent_version_expiration,
 		})
 	}
 
@@ -144,6 +172,34 @@ impl LifecycleRule {
 				.expiration
 				.as_ref()
 				.map(Expiration::from_garage_lifecycle_expiration),
+			noncurrent_version_expiration: rule
+				.noncurrent_version_expiration
+				.as_ref()
+				.map(NoncurrentVersionExpiration::from_garage),
+		}
+	}
+}
+
+impl NoncurrentVersionExpiration {
+	pub fn validate_into_garage(self) -> Result<GarageNoncurrentVersionExpiration, &'static str> {
+		if self.noncurrent_days.0 < 1 {
+			return Err("<NoncurrentDays> must be at least 1");
+		}
+		let newer_noncurrent_versions = match self.newer_noncurrent_versions {
+			None => None,
+			Some(n) if n.0 >= 0 => Some(n.0 as usize),
+			Some(_) => return Err("<NewerNoncurrentVersions> cannot be negative"),
+		};
+		Ok(GarageNoncurrentVersionExpiration {
+			noncurrent_days: self.noncurrent_days.0 as usize,
+			newer_noncurrent_versions,
+		})
+	}
+
+	pub fn from_garage(exp: &GarageNoncurrentVersionExpiration) -> Self {
+		Self {
+			noncurrent_days: IntValue(exp.noncurrent_days as i64),
+			newer_noncurrent_versions: exp.newer_noncurrent_versions.map(|n| IntValue(n as i64)),
 		}
 	}
 }
@@ -262,6 +318,10 @@ mod tests {
     <Expiration>
       <Days>365</Days>
     </Expiration>
+    <NoncurrentVersionExpiration>
+      <NoncurrentDays>30</NoncurrentDays>
+      <NewerNoncurrentVersions>3</NewerNoncurrentVersions>
+    </NoncurrentVersionExpiration>
   </Rule>
 </LifecycleConfiguration>"#;
 		let conf: LifecycleConfiguration = from_str(message).unwrap();
@@ -276,6 +336,7 @@ mod tests {
 						..Default::default()
 					}),
 					expiration: None,
+					noncurrent_version_expiration: None,
 					abort_incomplete_mpu: Some(AbortIncompleteMpu { days: IntValue(7) }),
 				},
 				LifecycleRule {
@@ -292,6 +353,10 @@ mod tests {
 					expiration: Some(Expiration {
 						days: Some(IntValue(365)),
 						at_date: None,
+					}),
+					noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+						noncurrent_days: IntValue(30),
+						newer_noncurrent_versions: Some(IntValue(3)),
 					}),
 					abort_incomplete_mpu: None,
 				},
@@ -320,6 +385,7 @@ mod tests {
 					..Default::default()
 				},
 				expiration: None,
+				noncurrent_version_expiration: None,
 				abort_incomplete_mpu_days: Some(7),
 			},
 			GarageLifecycleRule {
@@ -331,6 +397,10 @@ mod tests {
 					..Default::default()
 				},
 				expiration: Some(GarageLifecycleExpiration::AfterDays(365)),
+				noncurrent_version_expiration: Some(GarageNoncurrentVersionExpiration {
+					noncurrent_days: 30,
+					newer_noncurrent_versions: Some(3),
+				}),
 				abort_incomplete_mpu_days: None,
 			},
 		];

@@ -28,7 +28,9 @@ use crate::encryption::{EncryptionParams, OekDerivationInfo};
 use crate::error::*;
 use crate::get::{check_version_not_deleted, full_object_byte_stream, PreconditionHeaders};
 use crate::multipart;
+use crate::object_lock::{object_lock_from_headers, ObjectLockSettings};
 use crate::put::{extract_metadata_headers, save_stream, ChecksumMode, SaveStreamResult};
+use crate::versioning::{requested_version_id, response_version_id, X_AMZ_VERSION_ID};
 use crate::website::X_AMZ_WEBSITE_REDIRECT_LOCATION;
 use crate::xml::{self as s3_xml, xmlns_tag};
 
@@ -52,10 +54,17 @@ pub async fn handle_copy(
 
 	let checksum_algorithm = request_checksum_algorithm(req.headers())?;
 
-	let source_object = get_copy_source(&ctx, req).await?;
+	let (source_object, source_version_id) = get_copy_source(&ctx, req).await?;
 
 	let (source_version, source_version_data, source_version_meta) =
-		extract_source_info(&source_object)?;
+		extract_source_info(&source_object, source_version_id.as_deref())?;
+
+	// The destination bucket parameters are needed to build the response, but
+	// `ctx` is consumed by the copy itself.
+	let dest_bucket_params = ctx.bucket_params.clone();
+	let dest_version_kind =
+		ObjectVersionKind::for_versioning_state(dest_bucket_params.versioning());
+	let dest_object_lock = object_lock_from_headers(&dest_bucket_params, req.headers())?;
 
 	// Check precondition, e.g. x-amz-copy-source-if-match
 	copy_precondition.check_copy_source(source_version, &source_version_meta.etag)?;
@@ -153,6 +162,8 @@ pub async fn handle_copy(
 			uuid: dest_uuid,
 			object_meta: dest_object_meta,
 			encryption: dest_encryption,
+			version_kind: dest_version_kind,
+			object_lock: dest_object_lock,
 		};
 
 		// In most cases, we can just copy the metadata and link blocks of the
@@ -187,6 +198,8 @@ pub async fn handle_copy(
 			uuid: dest_uuid,
 			object_meta: dest_object_meta,
 			encryption: dest_encryption,
+			version_kind: dest_version_kind,
+			object_lock: dest_object_lock,
 		};
 		handle_copy_reencrypt(
 			ctx,
@@ -208,10 +221,17 @@ pub async fn handle_copy(
 
 	let mut resp = Response::builder()
 		.header("Content-Type", "application/xml")
-		.header("x-amz-version-id", hex::encode(res.version_uuid))
+		.header(
+			X_AMZ_VERSION_ID,
+			response_version_id(&dest_bucket_params, res.version_uuid),
+		)
 		.header(
 			"x-amz-copy-source-version-id",
-			hex::encode(source_version.uuid),
+			match source_version.kind {
+				ObjectVersionKind::Versioned => source_version.version_id(),
+				// Legacy behaviour on buckets that were never versioned
+				ObjectVersionKind::Null => hex::encode(source_version.uuid),
+			},
 		);
 	dest_encryption.add_response_headers(&mut resp);
 	Ok(resp.body(string_body(xml))?)
@@ -222,6 +242,8 @@ struct DestInfo<'a> {
 	uuid: Uuid,
 	object_meta: ObjectVersionMetaInner,
 	encryption: EncryptionParams,
+	version_kind: ObjectVersionKind,
+	object_lock: ObjectLockSettings,
 }
 
 async fn handle_copy_metaonly(
@@ -258,14 +280,13 @@ async fn handle_copy_metaonly(
 		ObjectVersionData::Inline(_meta, bytes) => {
 			// bytes is either plaintext before&after or encrypted with the
 			// same keys, so it's ok to just copy it as is
-			let dest_object_version = ObjectVersion {
-				uuid: dest_info.uuid,
-				timestamp: new_timestamp,
-				state: ObjectVersionState::Complete(ObjectVersionData::Inline(
-					new_meta,
-					bytes.clone(),
-				)),
-			};
+			let mut dest_object_version = ObjectVersion::new(
+				dest_info.uuid,
+				new_timestamp,
+				dest_info.version_kind,
+				ObjectVersionState::Complete(ObjectVersionData::Inline(new_meta, bytes.clone())),
+			);
+			dest_info.object_lock.apply(&mut dest_object_version);
 			let dest_object = Object::new(
 				dest_bucket_id,
 				dest_info.key.to_string(),
@@ -285,15 +306,17 @@ async fn handle_copy_metaonly(
 			// Write an "uploading" marker in Object table
 			// This holds a reference to the object in the Version table
 			// so that it won't be deleted, e.g. by repair_versions.
-			let tmp_dest_object_version = ObjectVersion {
-				uuid: dest_info.uuid,
-				timestamp: new_timestamp,
-				state: ObjectVersionState::Uploading {
+			let mut tmp_dest_object_version = ObjectVersion::new(
+				dest_info.uuid,
+				new_timestamp,
+				dest_info.version_kind,
+				ObjectVersionState::Uploading {
 					encryption: new_meta.encryption.clone(),
 					checksum_algorithm: None,
 					multipart: false,
 				},
-			};
+			);
+			dest_info.object_lock.apply(&mut tmp_dest_object_version);
 			let tmp_dest_object = Object::new(
 				dest_bucket_id,
 				dest_info.key.to_string(),
@@ -342,14 +365,16 @@ async fn handle_copy_metaonly(
 			// it to update the modification timestamp for instance). If we did this concurrently
 			// with the stuff before, the block's reference counts could be decremented before
 			// they are incremented again for the new version, leading to data being deleted.
-			let dest_object_version = ObjectVersion {
-				uuid: dest_info.uuid,
-				timestamp: new_timestamp,
-				state: ObjectVersionState::Complete(ObjectVersionData::FirstBlock(
+			let mut dest_object_version = ObjectVersion::new(
+				dest_info.uuid,
+				new_timestamp,
+				dest_info.version_kind,
+				ObjectVersionState::Complete(ObjectVersionData::FirstBlock(
 					new_meta,
 					*first_block_hash,
 				)),
-			};
+			);
+			dest_info.object_lock.apply(&mut dest_object_version);
 			let dest_object = Object::new(
 				dest_bucket_id,
 				dest_info.key.to_string(),
@@ -388,6 +413,7 @@ async fn handle_copy_reencrypt(
 		source_stream.map_err(|e| Error::from(GarageError::from(e))),
 		&dest_info.key.to_string(),
 		checksum_mode,
+		dest_info.object_lock,
 	)
 	.await
 }
@@ -406,7 +432,7 @@ pub async fn handle_upload_part_copy(
 	let dest_upload_id = multipart::decode_upload_id(upload_id)?;
 
 	let dest_key = dest_key.to_string();
-	let (source_object, (dest_object, dest_version, mut dest_mpu)) = futures::try_join!(
+	let ((source_object, source_version_id), (dest_object, dest_version, mut dest_mpu)) = futures::try_join!(
 		get_copy_source(&ctx, req),
 		multipart::get_upload(&ctx, &dest_key, &dest_upload_id)
 	)?;
@@ -414,7 +440,7 @@ pub async fn handle_upload_part_copy(
 	let ReqCtx { garage, .. } = ctx;
 
 	let (source_object_version, source_version_data, source_version_meta) =
-		extract_source_info(&source_object)?;
+		extract_source_info(&source_object, source_version_id.as_deref())?;
 
 	// Check precondition on source, e.g. x-amz-copy-source-if-match
 	copy_precondition.check_copy_source(source_object_version, &source_version_meta.etag)?;
@@ -737,12 +763,23 @@ pub async fn handle_upload_part_copy(
 	Ok(resp.body(string_body(resp_xml))?)
 }
 
-async fn get_copy_source(ctx: &ReqCtx, req: &Request<ReqBody>) -> Result<Object, Error> {
+/// The source object of a copy, and the version of it that the request refers
+/// to (None when it refers to the source object's current version)
+type CopySource = (Object, Option<String>);
+
+async fn get_copy_source(ctx: &ReqCtx, req: &Request<ReqBody>) -> Result<CopySource, Error> {
 	let ReqCtx {
 		garage, api_key, ..
 	} = ctx;
 
 	let copy_source = req.headers().get("x-amz-copy-source").unwrap().to_str()?;
+
+	// The version id is split off before percent-decoding, as a `?` inside the
+	// source key itself has to be percent-encoded by the client.
+	let (copy_source, source_version_id) = match copy_source.rsplit_once("?versionId=") {
+		Some((source, version_id)) => (source, Some(version_id.to_string())),
+		None => (copy_source, None),
+	};
 	let copy_source = percent_encoding::percent_decode_str(copy_source).decode_utf8()?;
 
 	let (source_bucket, source_key) = parse_bucket_key(&copy_source, None)?;
@@ -766,18 +803,30 @@ async fn get_copy_source(ctx: &ReqCtx, req: &Request<ReqBody>) -> Result<Object,
 		.await?
 		.ok_or(Error::NoSuchKey)?;
 
-	Ok(source_object)
+	let source_version_id = source_bucket
+		.params()
+		.and_then(|p| requested_version_id(p, source_version_id.as_deref()).map(str::to_string));
+
+	Ok((source_object, source_version_id))
 }
 
-fn extract_source_info(
-	source_object: &Object,
-) -> Result<(&ObjectVersion, &ObjectVersionData, &ObjectVersionMeta), Error> {
-	let source_version = source_object
-		.versions()
-		.iter()
-		.rev()
-		.find(|v| v.is_complete())
-		.ok_or(Error::NoSuchKey)?;
+fn extract_source_info<'a>(
+	source_object: &'a Object,
+	source_version_id: Option<&str>,
+) -> Result<
+	(
+		&'a ObjectVersion,
+		&'a ObjectVersionData,
+		&'a ObjectVersionMeta,
+	),
+	Error,
+> {
+	let source_version = match source_version_id {
+		Some(version_id) => source_object
+			.version_by_id(version_id)
+			.ok_or(Error::NoSuchVersion)?,
+		None => source_object.current_version().ok_or(Error::NoSuchKey)?,
+	};
 
 	let source_version_data = match &source_version.state {
 		ObjectVersionState::Complete(x) => x,
@@ -786,7 +835,13 @@ fn extract_source_info(
 
 	let source_version_meta = match source_version_data {
 		ObjectVersionData::DeleteMarker => {
-			return Err(Error::NoSuchKey);
+			// A delete marker holds no data to copy: asking for it explicitly
+			// is an error, while asking for the current version of an object
+			// that has been deleted is a plain "not found".
+			return Err(match source_version_id {
+				Some(_) => Error::MethodNotAllowed,
+				None => Error::NoSuchKey,
+			});
 		}
 		ObjectVersionData::Inline(meta, _bytes) => meta,
 		ObjectVersionData::FirstBlock(meta, _fbh) => meta,

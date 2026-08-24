@@ -46,6 +46,8 @@ pub struct Deleted {
 	pub key: Value,
 	#[serde(rename = "VersionId", skip_serializing_if = "Option::is_none")]
 	pub version_id: Option<Value>,
+	#[serde(rename = "DeleteMarker", skip_serializing_if = "Option::is_none")]
+	pub delete_marker: Option<Value>,
 	#[serde(
 		rename = "DeleteMarkerVersionId",
 		skip_serializing_if = "Option::is_none"
@@ -290,6 +292,77 @@ pub struct ListBucketResult {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ListVersionItem {
+	#[serde(rename = "Key")]
+	pub key: Value,
+	#[serde(rename = "VersionId")]
+	pub version_id: Value,
+	#[serde(rename = "IsLatest")]
+	pub is_latest: Value,
+	#[serde(rename = "LastModified")]
+	pub last_modified: Value,
+	#[serde(rename = "ETag")]
+	pub etag: Value,
+	#[serde(rename = "Size")]
+	pub size: IntValue,
+	#[serde(rename = "StorageClass")]
+	pub storage_class: Value,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ListDeleteMarkerItem {
+	#[serde(rename = "Key")]
+	pub key: Value,
+	#[serde(rename = "VersionId")]
+	pub version_id: Value,
+	#[serde(rename = "IsLatest")]
+	pub is_latest: Value,
+	#[serde(rename = "LastModified")]
+	pub last_modified: Value,
+}
+
+/// The result of a `ListObjectVersions` request
+///
+/// Note that, unlike AWS S3, Garage does not interleave the `Version` and
+/// `DeleteMarker` elements: all versions come first, then all delete markers.
+/// Both lists are individually sorted as the S3 API requires, which is what
+/// SDKs that expose them as two separate lists rely on.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ListVersionsResult {
+	#[serde(rename = "@xmlns", serialize_with = "xmlns_tag")]
+	pub xmlns: (),
+	#[serde(rename = "Name")]
+	pub name: Value,
+	#[serde(rename = "Prefix")]
+	pub prefix: Value,
+	#[serde(rename = "KeyMarker", skip_serializing_if = "Option::is_none")]
+	pub key_marker: Option<Value>,
+	#[serde(rename = "VersionIdMarker", skip_serializing_if = "Option::is_none")]
+	pub version_id_marker: Option<Value>,
+	#[serde(rename = "NextKeyMarker", skip_serializing_if = "Option::is_none")]
+	pub next_key_marker: Option<Value>,
+	#[serde(
+		rename = "NextVersionIdMarker",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub next_version_id_marker: Option<Value>,
+	#[serde(rename = "MaxKeys")]
+	pub max_keys: IntValue,
+	#[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+	pub delimiter: Option<Value>,
+	#[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+	pub encoding_type: Option<Value>,
+	#[serde(rename = "IsTruncated")]
+	pub is_truncated: Value,
+	#[serde(rename = "Version")]
+	pub versions: Vec<ListVersionItem>,
+	#[serde(rename = "DeleteMarker")]
+	pub delete_markers: Vec<ListDeleteMarkerItem>,
+	#[serde(rename = "CommonPrefixes")]
+	pub common_prefixes: Vec<CommonPrefix>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct VersioningConfiguration {
 	#[serde(rename = "@xmlns", serialize_with = "xmlns_tag")]
 	pub xmlns: (),
@@ -501,11 +574,13 @@ mod tests {
 				Deleted {
 					key: Value("a/plop".to_string()),
 					version_id: Some(Value("qsdfjklm".to_string())),
+					delete_marker: None,
 					delete_marker_version_id: Some(Value("wxcvbn".to_string())),
 				},
 				Deleted {
 					key: Value("b/plip".to_string()),
 					version_id: Some(Value("1234".to_string())),
+					delete_marker: Some(Value("true".to_string())),
 					delete_marker_version_id: Some(Value("4321".to_string())),
 				},
 			],
@@ -536,6 +611,7 @@ mod tests {
     <Deleted>\
         <Key>b/plip</Key>\
         <VersionId>1234</VersionId>\
+        <DeleteMarker>true</DeleteMarker>\
         <DeleteMarkerVersionId>4321</DeleteMarkerVersionId>\
     </Deleted>\
     <Error>\

@@ -10,7 +10,11 @@ use utoipa::{IntoParams, ToSchema};
 
 use garage_rpc::*;
 
+use garage_model::bucket_table::{
+	DefaultRetention, ObjectLockConfig, RetentionDuration, VersioningState,
+};
 use garage_model::garage::Garage;
+use garage_model::s3::object_table::ObjectLockMode;
 
 use garage_api_common::{common_error::CommonError, helpers::is_default, xml};
 
@@ -903,6 +907,133 @@ pub struct GetBucketInfoResponse {
 	pub unfinished_multipart_upload_bytes: i64,
 	/// Quotas that apply to this bucket
 	pub quotas: ApiBucketQuotas,
+	// FIXME for v3: remove serde(default) for the two fields below
+	/// Whether object versioning is enabled on this bucket
+	#[serde(default)]
+	pub versioning: ApiBucketVersioning,
+	/// Object Lock configuration of this bucket, if Object Lock is enabled
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub object_lock: Option<ApiObjectLockConfig>,
+}
+
+/// The Object Lock configuration of a bucket
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiObjectLockConfig {
+	/// Retention applied to new object versions when the request that creates
+	/// them does not specify any
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub default_retention: Option<ApiDefaultRetention>,
+}
+
+/// Default Object Lock retention settings of a bucket
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiDefaultRetention {
+	pub mode: ApiObjectLockMode,
+	/// Retention period in days; exactly one of `days` and `years` must be set
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub days: Option<u64>,
+	/// Retention period in years; exactly one of `days` and `years` must be set
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub years: Option<u64>,
+}
+
+/// The mode of an Object Lock retention setting
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum ApiObjectLockMode {
+	/// The version can be deleted before its retain-until date by a caller
+	/// that is allowed to bypass governance retention
+	Governance,
+	/// The version cannot be deleted by anyone before its retain-until date
+	Compliance,
+}
+
+impl ApiObjectLockConfig {
+	pub fn from_garage_object_lock_config(config: &ObjectLockConfig) -> Self {
+		Self {
+			default_retention: config.default_retention.map(|dr| {
+				let (days, years) = match dr.duration {
+					RetentionDuration::Days(d) => (Some(d), None),
+					RetentionDuration::Years(y) => (None, Some(y)),
+				};
+				ApiDefaultRetention {
+					mode: match dr.mode {
+						ObjectLockMode::Governance => ApiObjectLockMode::Governance,
+						ObjectLockMode::Compliance => ApiObjectLockMode::Compliance,
+					},
+					days,
+					years,
+				}
+			}),
+		}
+	}
+
+	pub fn into_garage_object_lock_config(self) -> Result<ObjectLockConfig, CommonError> {
+		let default_retention = match self.default_retention {
+			None => None,
+			Some(dr) => {
+				let duration = match (dr.days, dr.years) {
+					(Some(_), Some(_)) => {
+						return Err(CommonError::bad_request(
+							"Default retention cannot specify both days and years",
+						))
+					}
+					(Some(d), None) => RetentionDuration::Days(d),
+					(None, Some(y)) => RetentionDuration::Years(y),
+					(None, None) => {
+						return Err(CommonError::bad_request(
+							"Default retention must specify either days or years",
+						))
+					}
+				};
+				if duration.as_msec() == 0 {
+					return Err(CommonError::bad_request(
+						"Default retention period must be at least one day",
+					));
+				}
+				Some(DefaultRetention {
+					mode: match dr.mode {
+						ApiObjectLockMode::Governance => ObjectLockMode::Governance,
+						ApiObjectLockMode::Compliance => ObjectLockMode::Compliance,
+					},
+					duration,
+				})
+			}
+		};
+		Ok(ObjectLockConfig { default_retention })
+	}
+}
+
+/// The versioning state of a bucket
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum ApiBucketVersioning {
+	/// Versioning was never enabled on this bucket
+	#[default]
+	Disabled,
+	/// Each write creates a new version of the object
+	Enabled,
+	/// Versioning was enabled and then suspended: existing versions are kept,
+	/// but new writes overwrite the object's `null` version
+	Suspended,
+}
+
+impl ApiBucketVersioning {
+	pub fn from_garage_versioning_state(state: VersioningState) -> Self {
+		match state {
+			VersioningState::Disabled => Self::Disabled,
+			VersioningState::Enabled => Self::Enabled,
+			VersioningState::Suspended => Self::Suspended,
+		}
+	}
+
+	pub fn into_garage_versioning_state(self) -> VersioningState {
+		match self {
+			Self::Disabled => VersioningState::Disabled,
+			Self::Enabled => VersioningState::Enabled,
+			Self::Suspended => VersioningState::Suspended,
+		}
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -976,6 +1107,12 @@ pub struct UpdateBucketRequestBody {
 	pub cors_rules: Option<Vec<xml::cors::CorsRule>>,
 	#[serde(default)]
 	pub lifecycle_rules: Option<Vec<xml::lifecycle::LifecycleRule>>,
+	#[serde(default)]
+	pub versioning: Option<ApiBucketVersioning>,
+	/// Turn Object Lock on for this bucket and set its configuration.
+	/// Object Lock can never be turned off once it is on.
+	#[serde(default)]
+	pub object_lock: Option<ApiObjectLockConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1038,8 +1175,19 @@ pub struct InspectObjectResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct InspectObjectVersion {
-	/// Version ID
+	/// Internal UUID of this object version
 	pub uuid: String,
+	// FIXME for v3: remove serde(default) for the three fields below
+	/// The S3 version id of this version: `null` for the versions written
+	/// while bucket versioning was disabled or suspended
+	#[serde(default)]
+	pub s3_version_id: String,
+	/// Object Lock retention setting of this version, if it has one
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub retention: Option<InspectObjectRetention>,
+	/// Whether this version is under an Object Lock legal hold
+	#[serde(default)]
+	pub legal_hold: bool,
 	/// Creation timestamp of this object version
 	pub timestamp: DateTime<Utc>,
 	/// Whether this object version was created with SSE-C encryption
@@ -1063,6 +1211,15 @@ pub struct InspectObjectVersion {
 	/// List of data blocks for this object version
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub blocks: Vec<InspectObjectBlock>,
+}
+
+/// The Object Lock retention setting of an object version
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectObjectRetention {
+	pub mode: ApiObjectLockMode,
+	/// Date until which this version is retained
+	pub retain_until: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

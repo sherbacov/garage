@@ -47,6 +47,15 @@ pub enum Error {
 	#[error("Upload not found")]
 	NoSuchUpload,
 
+	/// The version of the object requested does not exist
+	#[error("Version not found")]
+	NoSuchVersion,
+
+	/// The operation is not allowed on this object version
+	/// (e.g. `GetObject` on a delete marker)
+	#[error("The specified method is not allowed against this resource")]
+	MethodNotAllowed,
+
 	/// CORS configuration doesn't exist for this bucket
 	#[error("The CORS configuration does not exist")]
 	NoSuchCORSConfiguration,
@@ -54,6 +63,18 @@ pub enum Error {
 	/// CORS configuration doesn't exist for this bucket
 	#[error("The lifecycle configuration does not exist")]
 	NoSuchLifecycleConfiguration,
+
+	/// Object Lock is not enabled on this bucket
+	#[error("Object Lock configuration does not exist for this bucket")]
+	ObjectLockConfigurationNotFound,
+
+	/// The object version has no Object Lock setting of the requested kind
+	#[error("The specified object does not have an Object Lock configuration")]
+	NoSuchObjectLockConfiguration,
+
+	/// The bucket is not in a state that allows the requested operation
+	#[error("The request is not valid with the current state of the bucket: {0}")]
+	InvalidBucketState(String),
 
 	/// Precondition failed (e.g. x-amz-copy-source-if-match)
 	#[error("At least one of the preconditions you specified did not hold")]
@@ -151,6 +172,8 @@ impl Error {
 			Error::Common(c) => c.aws_code(),
 			Error::NoSuchKey => "NoSuchKey",
 			Error::NoSuchUpload => "NoSuchUpload",
+			Error::NoSuchVersion => "NoSuchVersion",
+			Error::MethodNotAllowed => "MethodNotAllowed",
 			Error::PreconditionFailed => "PreconditionFailed",
 			Error::InvalidPart => "InvalidPart",
 			Error::InvalidPartOrder => "InvalidPartOrder",
@@ -165,6 +188,9 @@ impl Error {
 			Error::InvalidEncryptionAlgorithm(_) => "InvalidEncryptionAlgorithmError",
 			Error::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
 			Error::NoSuchLifecycleConfiguration => "NoSuchLifecycleConfiguration",
+			Error::ObjectLockConfigurationNotFound => "ObjectLockConfigurationNotFoundError",
+			Error::NoSuchObjectLockConfiguration => "NoSuchObjectLockConfiguration",
+			Error::InvalidBucketState(_) => "InvalidBucketState",
 		}
 	}
 }
@@ -176,8 +202,13 @@ impl ApiError for Error {
 			Error::Common(c) => c.http_status_code(),
 			Error::NoSuchKey
 			| Error::NoSuchUpload
+			| Error::NoSuchVersion
 			| Error::NoSuchCORSConfiguration
-			| Error::NoSuchLifecycleConfiguration => StatusCode::NOT_FOUND,
+			| Error::NoSuchLifecycleConfiguration
+			| Error::ObjectLockConfigurationNotFound
+			| Error::NoSuchObjectLockConfiguration => StatusCode::NOT_FOUND,
+			Error::InvalidBucketState(_) => StatusCode::CONFLICT,
+			Error::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
 			Error::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
 			Error::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
 			Error::InvalidXmlSe(_) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -22,6 +22,8 @@ impl Cli {
 			BucketOperation::Allow(query) => self.cmd_bucket_allow(query).await,
 			BucketOperation::Deny(query) => self.cmd_bucket_deny(query).await,
 			BucketOperation::Website(query) => self.cmd_bucket_website(query).await,
+			BucketOperation::Versioning(query) => self.cmd_bucket_versioning(query).await,
+			BucketOperation::ObjectLock(query) => self.cmd_bucket_object_lock(query).await,
 			BucketOperation::SetQuotas(query) => self.cmd_bucket_set_quotas(query).await,
 			BucketOperation::CleanupIncompleteUploads(query) => {
 				self.cmd_cleanup_incomplete_uploads(query).await
@@ -328,6 +330,118 @@ impl Cli {
 					quotas: None,
 					cors_rules: None,
 					lifecycle_rules: None,
+					versioning: None,
+					object_lock: None,
+				},
+			})
+			.await?;
+
+		print_bucket_info(&res.0);
+
+		Ok(())
+	}
+
+	pub async fn cmd_bucket_versioning(&self, opt: VersioningOpt) -> Result<(), Error> {
+		let versioning = match (opt.enable, opt.suspend) {
+			(true, false) => ApiBucketVersioning::Enabled,
+			(false, true) => ApiBucketVersioning::Suspended,
+			_ => {
+				return Err(Error::Message(
+					"You must specify exactly one of --enable or --suspend.".to_string(),
+				))
+			}
+		};
+
+		let bucket = self
+			.api_request(GetBucketInfoRequest {
+				id: None,
+				global_alias: None,
+				search: Some(opt.bucket.clone()),
+			})
+			.await?;
+
+		let res = self
+			.api_request(UpdateBucketRequest {
+				id: bucket.id.clone(),
+				body: UpdateBucketRequestBody {
+					website_access: None,
+					quotas: None,
+					cors_rules: None,
+					lifecycle_rules: None,
+					versioning: Some(versioning),
+					object_lock: None,
+				},
+			})
+			.await?;
+
+		print_bucket_info(&res.0);
+
+		Ok(())
+	}
+
+	pub async fn cmd_bucket_object_lock(&self, opt: ObjectLockOpt) -> Result<(), Error> {
+		if !opt.enable {
+			return Err(Error::Message(
+				"You must pass --enable: Object Lock can only be turned on, never off.".to_string(),
+			));
+		}
+
+		let bucket = self
+			.api_request(GetBucketInfoRequest {
+				id: None,
+				global_alias: None,
+				search: Some(opt.bucket.clone()),
+			})
+			.await?;
+
+		let mode = match opt.mode.as_deref() {
+			None => None,
+			Some("governance") => Some(ApiObjectLockMode::Governance),
+			Some("compliance") => Some(ApiObjectLockMode::Compliance),
+			Some(m) => {
+				return Err(Error::Message(format!(
+					"Invalid retention mode `{}`, expected governance or compliance",
+					m
+				)))
+			}
+		};
+
+		let default_retention = if opt.no_default_retention {
+			if mode.is_some() || opt.days.is_some() || opt.years.is_some() {
+				return Err(Error::Message(
+					"--no-default-retention cannot be combined with --mode, --days or --years."
+						.to_string(),
+				));
+			}
+			None
+		} else if mode.is_some() || opt.days.is_some() || opt.years.is_some() {
+			let mode = mode.ok_or_message("--mode is required to set a default retention")?;
+			if opt.days.is_some() == opt.years.is_some() {
+				return Err(Error::Message(
+					"You must specify exactly one of --days or --years.".to_string(),
+				));
+			}
+			Some(ApiDefaultRetention {
+				mode,
+				days: opt.days,
+				years: opt.years,
+			})
+		} else {
+			// Keep the default retention the bucket already has, if any
+			bucket.object_lock.and_then(|ol| ol.default_retention)
+		};
+
+		let res = self
+			.api_request(UpdateBucketRequest {
+				id: bucket.id.clone(),
+				body: UpdateBucketRequestBody {
+					website_access: None,
+					quotas: None,
+					cors_rules: None,
+					lifecycle_rules: None,
+					// Object Lock requires versioning, so turn it on as well
+					versioning: Some(ApiBucketVersioning::Enabled),
+					object_lock: Some(ApiObjectLockConfig { default_retention }),
 				},
 			})
 			.await?;
@@ -380,6 +494,8 @@ impl Cli {
 					quotas: Some(new_quotas),
 					cors_rules: None,
 					lifecycle_rules: None,
+					versioning: None,
+					object_lock: None,
 				},
 			})
 			.await?;
@@ -444,6 +560,7 @@ impl Cli {
 				format!("Bucket ID:\t{}", info.bucket_id),
 				format!("Key:\t{}", info.key),
 				format!("Version ID:\t{}", ver.uuid),
+				format!("S3 version ID:\t{}", ver.s3_version_id),
 				format!("Timestamp:\t{}", ver.timestamp),
 			];
 			if let Some(size) = ver.size {
@@ -468,6 +585,19 @@ impl Cli {
 				format!("Delete marker:\t{}", ver.delete_marker),
 				format!("Inline data:\t{}", ver.inline),
 			]);
+			if let Some(retention) = &ver.retention {
+				tab.push(format!(
+					"Retained:\t{} mode, until {}",
+					match retention.mode {
+						ApiObjectLockMode::Governance => "governance",
+						ApiObjectLockMode::Compliance => "compliance",
+					},
+					retention.retain_until.with_timezone(&Local)
+				));
+			}
+			if ver.legal_hold {
+				tab.push("Legal hold:\ton".to_string());
+			}
 			if !ver.headers.is_empty() {
 				tab.push(String::new());
 				tab.extend(ver.headers.iter().map(|(k, v)| format!("{}\t{}", k, v)));
@@ -526,6 +656,36 @@ fn print_bucket_info(bucket: &GetBucketInfoResponse) {
 	}
 
 	info.extend([
+		String::new(),
+		format!(
+			"Versioning:\t{}",
+			match bucket.versioning {
+				ApiBucketVersioning::Disabled => "disabled",
+				ApiBucketVersioning::Enabled => "enabled",
+				ApiBucketVersioning::Suspended => "suspended",
+			}
+		),
+		format!(
+			"Object Lock:\t{}",
+			match &bucket.object_lock {
+				None => "disabled".to_string(),
+				Some(ol) => match &ol.default_retention {
+					None => "enabled, no default retention".to_string(),
+					Some(dr) => format!(
+						"enabled, new objects retained in {} mode for {}",
+						match dr.mode {
+							ApiObjectLockMode::Governance => "governance",
+							ApiObjectLockMode::Compliance => "compliance",
+						},
+						match (dr.days, dr.years) {
+							(Some(d), _) => format!("{} day(s)", d),
+							(_, Some(y)) => format!("{} year(s)", y),
+							_ => "an unspecified duration".to_string(),
+						}
+					),
+				},
+			}
+		),
 		String::new(),
 		format!("Website access:\t{}", bucket.website_access),
 	]);

@@ -297,6 +297,14 @@ pub enum BucketOperation {
 	#[structopt(name = "website", version = garage_version())]
 	Website(WebsiteOpt),
 
+	/// Enable or suspend object versioning for this bucket
+	#[structopt(name = "versioning", version = garage_version())]
+	Versioning(VersioningOpt),
+
+	/// Turn on Object Lock for this bucket, or change its default retention
+	#[structopt(name = "object-lock", version = garage_version())]
+	ObjectLock(ObjectLockOpt),
+
 	/// Set the quotas for this bucket
 	#[structopt(name = "set-quotas", version = garage_version())]
 	SetQuotas(SetQuotasOpt),
@@ -330,6 +338,50 @@ pub struct WebsiteOpt {
 	/// Error document: the optional document returned when an error occurs
 	#[structopt(short = "e", long = "error-document")]
 	pub error_document: Option<String>,
+}
+
+#[derive(StructOpt, Debug)]
+pub struct VersioningOpt {
+	/// Keep every version of the objects written to this bucket
+	#[structopt(long = "enable")]
+	pub enable: bool,
+
+	/// Stop creating new versions, keeping the ones that already exist
+	#[structopt(long = "suspend")]
+	pub suspend: bool,
+
+	/// Bucket name
+	pub bucket: String,
+}
+
+#[derive(StructOpt, Debug)]
+pub struct ObjectLockOpt {
+	/// Turn Object Lock on for this bucket, which also turns versioning on.
+	/// Object Lock can never be turned off once it is on.
+	#[structopt(long = "enable")]
+	pub enable: bool,
+
+	/// Retention mode applied by default to new objects: `governance` or
+	/// `compliance`. Objects retained in compliance mode cannot be deleted by
+	/// anyone, not even a cluster administrator, before their retain-until
+	/// date.
+	#[structopt(long = "mode")]
+	pub mode: Option<String>,
+
+	/// Number of days new objects are retained by default
+	#[structopt(long = "days")]
+	pub days: Option<u64>,
+
+	/// Number of years new objects are retained by default
+	#[structopt(long = "years")]
+	pub years: Option<u64>,
+
+	/// Stop applying a default retention to new objects
+	#[structopt(long = "no-default-retention")]
+	pub no_default_retention: bool,
+
+	/// Bucket name
+	pub bucket: String,
 }
 
 #[derive(StructOpt, Debug)]

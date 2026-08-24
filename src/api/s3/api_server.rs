@@ -28,9 +28,11 @@ use crate::get::*;
 use crate::lifecycle::*;
 use crate::list::*;
 use crate::multipart::*;
+use crate::object_lock::*;
 use crate::post_object::handle_post_object;
 use crate::put::*;
 use crate::router::Endpoint;
+use crate::versioning::*;
 use crate::website::*;
 
 pub use garage_api_common::signature::streaming::ReqBody;
@@ -172,8 +174,20 @@ impl ApiHandler for S3ApiServer {
 
 		let resp = match endpoint {
 			Endpoint::HeadObject {
-				key, part_number, ..
-			} => handle_head(ctx, &req.map(|_| ()), &key, part_number).await,
+				key,
+				part_number,
+				version_id,
+				..
+			} => {
+				handle_head(
+					ctx,
+					&req.map(|_| ()),
+					&key,
+					part_number,
+					version_id.as_deref(),
+				)
+				.await
+			}
 			Endpoint::GetObject {
 				key,
 				part_number,
@@ -183,6 +197,7 @@ impl ApiHandler for S3ApiServer {
 				response_content_language,
 				response_content_type,
 				response_expires,
+				version_id,
 				..
 			} => {
 				let overrides = GetObjectOverrides {
@@ -193,7 +208,15 @@ impl ApiHandler for S3ApiServer {
 					response_content_type,
 					response_expires,
 				};
-				handle_get(ctx, &req.map(|_| ()), &key, part_number, overrides).await
+				handle_get(
+					ctx,
+					&req.map(|_| ()),
+					&key,
+					part_number,
+					overrides,
+					version_id.as_deref(),
+				)
+				.await
 			}
 			Endpoint::UploadPart {
 				key,
@@ -210,7 +233,12 @@ impl ApiHandler for S3ApiServer {
 			Endpoint::AbortMultipartUpload { key, upload_id } => {
 				handle_abort_multipart_upload(ctx, &key, &upload_id).await
 			}
-			Endpoint::DeleteObject { key, .. } => handle_delete(ctx, &key).await,
+			Endpoint::DeleteObject {
+				key, version_id, ..
+			} => {
+				let bypass_governance = bypass_governance_retention(req.headers());
+				handle_delete(ctx, &key, version_id.as_deref(), bypass_governance).await
+			}
 			Endpoint::CreateMultipartUpload { key } => {
 				handle_create_multipart_upload(ctx, &req, &key).await
 			}
@@ -224,7 +252,26 @@ impl ApiHandler for S3ApiServer {
 			}
 			Endpoint::DeleteBucket {} => handle_delete_bucket(ctx).await,
 			Endpoint::GetBucketLocation {} => handle_get_bucket_location(ctx),
-			Endpoint::GetBucketVersioning {} => handle_get_bucket_versioning(),
+			Endpoint::GetBucketVersioning {} => handle_get_bucket_versioning(ctx),
+			Endpoint::PutBucketVersioning {} => handle_put_bucket_versioning(ctx, req).await,
+			Endpoint::GetObjectLockConfiguration {} => {
+				handle_get_object_lock_configuration(ctx).await
+			}
+			Endpoint::PutObjectLockConfiguration {} => {
+				handle_put_object_lock_configuration(ctx, req).await
+			}
+			Endpoint::GetObjectRetention { key, version_id } => {
+				handle_get_object_retention(ctx, &key, version_id.as_deref()).await
+			}
+			Endpoint::PutObjectRetention { key, version_id } => {
+				handle_put_object_retention(ctx, req, &key, version_id.as_deref()).await
+			}
+			Endpoint::GetObjectLegalHold { key, version_id } => {
+				handle_get_object_legal_hold(ctx, &key, version_id.as_deref()).await
+			}
+			Endpoint::PutObjectLegalHold { key, version_id } => {
+				handle_put_object_legal_hold(ctx, req, &key, version_id.as_deref()).await
+			}
 			Endpoint::GetBucketAcl {} => handle_get_bucket_acl(ctx),
 			Endpoint::ListObjects {
 				delimiter,
@@ -281,6 +328,28 @@ impl ApiHandler for S3ApiServer {
 						list_type
 					)))
 				}
+			}
+			Endpoint::ListObjectVersions {
+				delimiter,
+				encoding_type,
+				key_marker,
+				max_keys,
+				prefix,
+				version_id_marker,
+			} => {
+				let query = ListObjectVersionsQuery {
+					common: ListQueryCommon {
+						bucket_name: ctx.bucket_name.clone(),
+						bucket_id,
+						delimiter,
+						page_size: max_keys.unwrap_or(1000).clamp(1, 1000) as usize,
+						prefix: prefix.unwrap_or_default(),
+						urlencode_resp: encoding_type.map(|e| e == "url").unwrap_or(false),
+					},
+					key_marker,
+					version_id_marker,
+				};
+				handle_list_versions(ctx, &query).await
 			}
 			Endpoint::ListMultipartUploads {
 				delimiter,

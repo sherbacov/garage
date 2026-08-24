@@ -45,6 +45,13 @@ pub struct ListObjectsQuery {
 }
 
 #[derive(Debug)]
+pub struct ListObjectVersionsQuery {
+	pub key_marker: Option<String>,
+	pub version_id_marker: Option<String>,
+	pub common: ListQueryCommon,
+}
+
+#[derive(Debug)]
 pub struct ListMultipartUploadsQuery {
 	pub key_marker: Option<String>,
 	pub upload_id_marker: Option<String>,
@@ -166,6 +173,112 @@ pub async fn handle_list(
 		.body(string_body(xml))?)
 }
 
+pub async fn handle_list_versions(
+	ctx: ReqCtx,
+	query: &ListObjectVersionsQuery,
+) -> Result<Response<ResBody>, Error> {
+	let ReqCtx { garage, .. } = &ctx;
+
+	let io = |bucket, key, count| {
+		let t = &garage.object_table;
+		async move {
+			t.get_range(
+				&bucket,
+				key,
+				Some(ObjectFilter::HasVersions),
+				count,
+				EnumerationOrder::Forward,
+			)
+			.await
+		}
+	};
+
+	debug!("ListObjectVersions {:?}", query);
+	let mut acc = query.build_accumulator();
+	let pagination = fetch_list_entries(&query.common, query.begin(), &mut acc, &io).await?;
+
+	let mut versions = Vec::new();
+	let mut delete_markers = Vec::new();
+	for (sort_key, info) in acc.keys.iter() {
+		let key = uriencode_maybe(&sort_key.key, query.common.urlencode_resp);
+		let version_id = s3_xml::Value(info.version_id.clone());
+		let is_latest = s3_xml::Value(format!("{}", info.is_latest));
+		let last_modified = s3_xml::Value(msec_to_rfc3339(info.last_modified));
+		match &info.data {
+			Some((size, etag)) => versions.push(s3_xml::ListVersionItem {
+				key,
+				version_id,
+				is_latest,
+				last_modified,
+				etag: s3_xml::Value(format!("\"{}\"", etag)),
+				size: s3_xml::IntValue(*size as i64),
+				storage_class: s3_xml::Value("STANDARD".to_string()),
+			}),
+			None => delete_markers.push(s3_xml::ListDeleteMarkerItem {
+				key,
+				version_id,
+				is_latest,
+				last_modified,
+			}),
+		}
+	}
+
+	let result = s3_xml::ListVersionsResult {
+		xmlns: (),
+
+		// Sending back some information about the request
+		name: s3_xml::Value(query.common.bucket_name.to_string()),
+		prefix: uriencode_maybe(&query.common.prefix, query.common.urlencode_resp),
+		delimiter: query
+			.common
+			.delimiter
+			.as_ref()
+			.map(|d| uriencode_maybe(d, query.common.urlencode_resp)),
+		max_keys: s3_xml::IntValue(query.common.page_size as i64),
+		key_marker: query
+			.key_marker
+			.as_ref()
+			.map(|m| uriencode_maybe(m, query.common.urlencode_resp)),
+		version_id_marker: query
+			.version_id_marker
+			.as_ref()
+			.map(|m| s3_xml::Value(m.to_string())),
+		encoding_type: match query.common.urlencode_resp {
+			true => Some(s3_xml::Value("url".to_string())),
+			false => None,
+		},
+
+		// Handling pagination
+		is_truncated: s3_xml::Value(format!("{}", pagination.is_some())),
+		next_key_marker: pagination
+			.as_ref()
+			.map(|p| uriencode_maybe(p.key(), query.common.urlencode_resp)),
+		next_version_id_marker: match &pagination {
+			Some(RangeBegin::AfterVersion { version_id, .. }) => {
+				Some(s3_xml::Value(version_id.clone()))
+			}
+			_ => None,
+		},
+
+		// Result body
+		versions,
+		delete_markers,
+		common_prefixes: acc
+			.common_prefixes
+			.iter()
+			.map(|pfx| s3_xml::CommonPrefix {
+				prefix: uriencode_maybe(pfx, query.common.urlencode_resp),
+			})
+			.collect(),
+	};
+
+	let xml = s3_xml::to_xml_with_header(&result)?;
+
+	Ok(Response::builder()
+		.header("Content-Type", "application/xml")
+		.body(string_body(xml))?)
+}
+
 pub async fn handle_list_multipart_upload(
 	ctx: ReqCtx,
 	query: &ListMultipartUploadsQuery,
@@ -219,14 +332,9 @@ pub async fn handle_list_multipart_upload(
 
 		// Handling pagination
 		is_truncated: s3_xml::Value(format!("{}", pagination.is_some())),
-		next_key_marker: match &pagination {
-			None => None,
-			Some(RangeBegin::AfterKey { key })
-			| Some(RangeBegin::AfterUpload { key, .. })
-			| Some(RangeBegin::IncludingKey { key, .. }) => {
-				Some(uriencode_maybe(key, query.common.urlencode_resp))
-			}
-		},
+		next_key_marker: pagination
+			.as_ref()
+			.map(|p| uriencode_maybe(p.key(), query.common.urlencode_resp)),
 		next_upload_id_marker: match pagination {
 			Some(RangeBegin::AfterUpload { upload, .. }) => {
 				Some(s3_xml::Value(hex::encode(upload)))
@@ -392,6 +500,25 @@ struct UploadInfo {
 	timestamp: u64,
 }
 
+/// The position of a version of an object in a `ListObjectVersions` listing:
+/// keys are listed in lexicographic order, and the versions of a key are
+/// listed most recent first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VersionSortKey {
+	key: String,
+	rev_timestamp: std::cmp::Reverse<u64>,
+	uuid: Uuid,
+}
+
+#[derive(Debug, PartialEq)]
+struct VersionInfo {
+	version_id: String,
+	is_latest: bool,
+	last_modified: u64,
+	/// Size and etag of the version, or None if it is a delete marker
+	data: Option<(u64, String)>,
+}
+
 #[derive(Debug, PartialEq)]
 struct PartInfo<'a> {
 	etag: &'a str,
@@ -407,6 +534,10 @@ enum ExtractionResult {
 	FilledAtUpload {
 		key: String,
 		upload: Uuid,
+	},
+	FilledAtVersion {
+		key: String,
+		version_id: String,
 	},
 	Extracted {
 		key: String,
@@ -434,7 +565,24 @@ enum RangeBegin {
 		key: String,
 		upload: Uuid,
 	},
+	AfterVersion {
+		key: String,
+		version_id: String,
+	},
 }
+
+impl RangeBegin {
+	/// The object key at which the listing resumes
+	fn key(&self) -> &String {
+		match self {
+			RangeBegin::IncludingKey { key, .. }
+			| RangeBegin::AfterKey { key }
+			| RangeBegin::AfterUpload { key, .. }
+			| RangeBegin::AfterVersion { key, .. } => key,
+		}
+	}
+}
+
 type Pagination = Option<RangeBegin>;
 
 /*
@@ -457,11 +605,7 @@ where
 	let count = query.page_size + 1;
 
 	loop {
-		let start_key = match cursor {
-			RangeBegin::AfterKey { ref key }
-			| RangeBegin::AfterUpload { ref key, .. }
-			| RangeBegin::IncludingKey { ref key, .. } => Some(key.clone()),
-		};
+		let start_key = Some(cursor.key().clone());
 
 		// Fetch objects
 		let objects = io(query.bucket_id, start_key.clone(), count).await?;
@@ -501,6 +645,9 @@ where
 				}
 				ExtractionResult::FilledAtUpload { key, upload } => {
 					return Ok(Some(RangeBegin::AfterUpload { key, upload }));
+				}
+				ExtractionResult::FilledAtVersion { key, version_id } => {
+					return Ok(Some(RangeBegin::AfterVersion { key, version_id }));
 				}
 				ExtractionResult::Filled => {
 					return Ok(Some(cursor));
@@ -643,6 +790,32 @@ impl ListObjectsQuery {
 	}
 }
 
+impl ListObjectVersionsQuery {
+	fn build_accumulator(&self) -> VersionAccumulator {
+		VersionAccumulator::new(self.common.page_size)
+	}
+
+	fn begin(&self) -> RangeBegin {
+		match (&self.key_marker, &self.version_id_marker) {
+			// If both markers are set, we resume the listing at the given key,
+			// after the given version of it.
+			(Some(key), Some(version_id)) => RangeBegin::AfterVersion {
+				key: key.to_string(),
+				version_id: version_id.to_string(),
+			},
+			// If only the key marker is set, we resume the listing after that
+			// key, as the S3 API specifies.
+			(Some(key), None) => RangeBegin::AfterKey {
+				key: key.to_string(),
+			},
+			_ => RangeBegin::IncludingKey {
+				key: self.common.prefix.to_string(),
+				fallback_key: None,
+			},
+		}
+	}
+}
+
 impl ListMultipartUploadsQuery {
 	fn build_accumulator(&self) -> UploadAccumulator {
 		UploadAccumulator::new(self.common.page_size)
@@ -702,6 +875,7 @@ struct Accumulator<K, V> {
 
 type ObjectAccumulator = Accumulator<String, ObjectInfo>;
 type UploadAccumulator = Accumulator<Uuid, UploadInfo>;
+type VersionAccumulator = Accumulator<VersionSortKey, VersionInfo>;
 
 impl<K: std::cmp::Ord, V> Accumulator<K, V> {
 	fn new(page_size: usize) -> Accumulator<K, V> {
@@ -806,7 +980,9 @@ impl ExtractAccumulator for ObjectAccumulator {
 		let object = objects.next().expect("This iterator can not be empty as it is checked earlier in the code. This is a logic bug, please report it.");
 		assert!(object.key.starts_with(&query.prefix));
 
-		let version = match object.versions().iter().find(|x| x.is_data()) {
+		// ListObjects only reports the current version of each object, which is
+		// the only one that has a key of its own.
+		let version = match object.current_version().filter(|v| v.is_data()) {
 			Some(v) => v,
 			None => unreachable!(
 				"Expect to have objects having data due to earlier filtering. This is a logic bug."
@@ -829,6 +1005,120 @@ impl ExtractAccumulator for ObjectAccumulator {
 				key: object.key.clone(),
 			},
 			false => ExtractionResult::Filled,
+		}
+	}
+}
+
+impl VersionAccumulator {
+	/// Add one version of an object to the listing, and return its version id
+	/// if it could be added
+	fn try_insert_version(
+		&mut self,
+		key: &str,
+		version: &ObjectVersion,
+		is_latest: bool,
+	) -> Option<String> {
+		let version_id = version.version_id();
+		let data = match &version.state {
+			ObjectVersionState::Complete(ObjectVersionData::Inline(meta, _))
+			| ObjectVersionState::Complete(ObjectVersionData::FirstBlock(meta, _)) => {
+				Some((meta.size, meta.etag.to_string()))
+			}
+			// Delete markers are listed too, without size nor etag
+			_ => None,
+		};
+
+		let sort_key = VersionSortKey {
+			key: key.to_string(),
+			rev_timestamp: std::cmp::Reverse(version.timestamp),
+			uuid: version.uuid,
+		};
+		let info = VersionInfo {
+			version_id: version_id.clone(),
+			is_latest,
+			last_modified: version.timestamp,
+			data,
+		};
+
+		match self.try_insert_entry(sort_key, info) {
+			true => Some(version_id),
+			false => None,
+		}
+	}
+}
+
+impl ExtractAccumulator for VersionAccumulator {
+	/// Observe the iterator, process a single key, and try to extract all of
+	/// the versions of that key
+	fn extract<'a>(
+		&mut self,
+		query: &ListQueryCommon,
+		cursor: &RangeBegin,
+		objects: &mut Peekable<impl Iterator<Item = &'a Object>>,
+	) -> ExtractionResult {
+		if let Some(e) = self.extract_common_prefix(objects, query) {
+			return e;
+		}
+
+		let object = objects.next().expect("This iterator can not be empty as it is checked earlier in the code. This is a logic bug, please report it.");
+
+		// The versions of a key are listed most recent first, so the current
+		// version of the object comes first.
+		let mut versions = object
+			.versions()
+			.iter()
+			.filter(|v| v.is_complete())
+			.rev()
+			.enumerate()
+			.map(|(i, v)| (v, i == 0))
+			.collect::<Vec<_>>();
+
+		// Skip the versions that a previous page of the listing already returned
+		if let RangeBegin::AfterVersion { version_id, .. } = cursor {
+			// If the marker version has been deleted since the previous page
+			// was returned, there is no way to know where the listing stopped,
+			// so the whole key is listed again rather than risking to skip
+			// versions that the client has never seen.
+			if let Some(i) = versions
+				.iter()
+				.position(|(v, _)| &v.version_id() == version_id)
+			{
+				versions.drain(..=i);
+			}
+		}
+
+		let mut versions = versions.into_iter();
+
+		// The first entry is a specific case as it changes our result enum type
+		let (first_version, first_is_latest) = match versions.next() {
+			Some(v) => v,
+			None => {
+				return ExtractionResult::Extracted {
+					key: object.key.clone(),
+				}
+			}
+		};
+		let mut prev_version_id =
+			match self.try_insert_version(&object.key, first_version, first_is_latest) {
+				Some(version_id) => version_id,
+				None => return ExtractionResult::Filled,
+			};
+
+		// We can then collect the remaining versions in a loop
+		for (version, is_latest) in versions {
+			match self.try_insert_version(&object.key, version, is_latest) {
+				Some(version_id) => prev_version_id = version_id,
+				None => {
+					return ExtractionResult::FilledAtVersion {
+						key: object.key.clone(),
+						version_id: prev_version_id,
+					}
+				}
+			}
+		}
+
+		ExtractionResult::Extracted {
+			key: object.key.clone(),
 		}
 	}
 }
@@ -990,10 +1280,11 @@ mod tests {
 	}
 
 	fn objup_version(uuid: [u8; 32]) -> ObjectVersion {
-		ObjectVersion {
-			uuid: Uuid::from(uuid),
-			timestamp: TS,
-			state: ObjectVersionState::Uploading {
+		ObjectVersion::new(
+			Uuid::from(uuid),
+			TS,
+			ObjectVersionKind::Null,
+			ObjectVersionState::Uploading {
 				multipart: true,
 				encryption: ObjectVersionEncryption::Plaintext {
 					inner: ObjectVersionMetaInner {
@@ -1004,7 +1295,7 @@ mod tests {
 				},
 				checksum_algorithm: None,
 			},
-		}
+		)
 	}
 
 	#[test]

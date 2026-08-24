@@ -24,6 +24,7 @@ use garage_util::error::Error as GarageError;
 use garage_util::time::*;
 
 use garage_block::manager::INLINE_THRESHOLD;
+use garage_model::bucket_table::VersioningState;
 use garage_model::garage::Garage;
 use garage_model::index_counter::CountedItem;
 use garage_model::s3::block_ref_table::*;
@@ -37,6 +38,8 @@ use garage_api_common::signature::checksum::*;
 use crate::api_server::{ReqBody, ResBody};
 use crate::encryption::{EncryptionParams, OekDerivationInfo};
 use crate::error::*;
+use crate::object_lock::{object_lock_from_headers, ObjectLockSettings};
+use crate::versioning::{response_version_id, X_AMZ_VERSION_ID};
 use crate::website::X_AMZ_WEBSITE_REDIRECT_LOCATION;
 
 pub(crate) struct SaveStreamResult {
@@ -67,6 +70,8 @@ pub async fn handle_put(
 	// Retrieve interesting headers from request
 	let headers = extract_metadata_headers(req.headers())?;
 	debug!("Object headers: {:?}", headers);
+
+	let object_lock = object_lock_from_headers(&ctx.bucket_params, req.headers())?;
 
 	let expected_checksums = ExpectedChecksums {
 		md5: match req.headers().get("content-md5") {
@@ -120,17 +125,22 @@ pub async fn handle_put(
 			checksummer,
 			trailer_algo: trailer_checksum_algorithm,
 		},
+		object_lock,
 	)
 	.await?;
 
 	let mut resp = Response::builder()
-		.header("x-amz-version-id", hex::encode(res.version_uuid))
+		.header(
+			X_AMZ_VERSION_ID,
+			response_version_id(&ctx.bucket_params, res.version_uuid),
+		)
 		.header("ETag", format!("\"{}\"", res.etag));
 	encryption.add_response_headers(&mut resp);
 	let resp = add_checksum_response_headers(&expected_checksums.extra, resp);
 	Ok(resp.body(empty_body())?)
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 	ctx: &ReqCtx,
 	version_uuid: Uuid,
@@ -139,10 +149,13 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 	body: S,
 	key: &String,
 	checksum_mode: ChecksumMode,
+	object_lock: ObjectLockSettings,
 ) -> Result<SaveStreamResult, Error> {
 	let ReqCtx {
 		garage, bucket_id, ..
 	} = ctx;
+
+	let version_kind = ObjectVersionKind::for_versioning_state(ctx.bucket_params.versioning());
 
 	let mut chunker = StreamChunker::new(body, garage.config.block_size);
 	let (first_block_opt, existing_object) = try_join!(
@@ -200,10 +213,11 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 		let etag = encryption.etag_from_md5(&checksums.md5);
 		let inline_data = encryption.encrypt_blob(&first_block)?.to_vec();
 
-		let object_version = ObjectVersion {
-			uuid: version_uuid,
-			timestamp: version_timestamp,
-			state: ObjectVersionState::Complete(ObjectVersionData::Inline(
+		let mut object_version = ObjectVersion::new(
+			version_uuid,
+			version_timestamp,
+			version_kind,
+			ObjectVersionState::Complete(ObjectVersionData::Inline(
 				ObjectVersionMeta {
 					encryption: encryption.encrypt_meta(meta)?,
 					size,
@@ -211,7 +225,8 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 				},
 				inline_data,
 			)),
-		};
+		);
+		object_lock.apply(&mut object_version);
 
 		let object = Object::new(*bucket_id, key.into(), vec![object_version]);
 		garage.object_table.insert(&object).await?;
@@ -232,19 +247,22 @@ pub(crate) async fn save_stream<S: Stream<Item = Result<Bytes, Error>> + Unpin>(
 		key: key.into(),
 		version_uuid,
 		version_timestamp,
+		version_kind,
 	}));
 
 	// Write version identifier in object table so that we have a trace
 	// that we are uploading something
-	let mut object_version = ObjectVersion {
-		uuid: version_uuid,
-		timestamp: version_timestamp,
-		state: ObjectVersionState::Uploading {
+	let mut object_version = ObjectVersion::new(
+		version_uuid,
+		version_timestamp,
+		version_kind,
+		ObjectVersionState::Uploading {
 			encryption: encryption.encrypt_meta(meta.clone())?,
 			checksum_algorithm: None, // don't care; overwritten later
 			multipart: false,
 		},
-	};
+	);
+	object_lock.apply(&mut object_version);
 	let object = Object::new(*bucket_id, key.into(), vec![object_version.clone()]);
 	garage.object_table.insert(&object).await?;
 
@@ -362,7 +380,15 @@ pub(crate) async fn check_quotas(
 		None => (0, 0),
 	};
 	let cnt_obj_diff = 1 - prev_cnt_obj;
-	let cnt_size_diff = size as i64 - prev_cnt_size;
+	let cnt_size_diff = match bucket_params.versioning() {
+		// On a bucket that was never versioned, the previous version of the
+		// object is replaced by the one being written
+		VersioningState::Disabled => size as i64 - prev_cnt_size,
+		// Otherwise previous versions are kept, so the object only grows. An
+		// existing `null` version that the write replaces is not deduced, so
+		// the check errs on the safe side.
+		VersioningState::Enabled | VersioningState::Suspended => size as i64,
+	};
 
 	if let Some(mo) = quotas.max_objects {
 		let current_objects = counters.get(OBJECTS).cloned().unwrap_or_default();
@@ -636,6 +662,7 @@ struct InterruptedCleanupInner {
 	key: String,
 	version_uuid: Uuid,
 	version_timestamp: u64,
+	version_kind: ObjectVersionKind,
 }
 
 impl InterruptedCleanup {
@@ -647,11 +674,12 @@ impl Drop for InterruptedCleanup {
 	fn drop(&mut self) {
 		if let Some(info) = self.0.take() {
 			tokio::spawn(async move {
-				let object_version = ObjectVersion {
-					uuid: info.version_uuid,
-					timestamp: info.version_timestamp,
-					state: ObjectVersionState::Aborted,
-				};
+				let object_version = ObjectVersion::new(
+					info.version_uuid,
+					info.version_timestamp,
+					info.version_kind,
+					ObjectVersionState::Aborted,
+				);
 				let object = Object::new(info.bucket_id, info.key, vec![object_version]);
 				if let Err(e) = info.garage.object_table.insert(&object).await {
 					warn!("Cannot cleanup after aborted PutObject: {}", e);

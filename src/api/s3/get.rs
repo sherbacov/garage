@@ -33,6 +33,8 @@ use crate::api_server::ResBody;
 use crate::copy::*;
 use crate::encryption::{EncryptionParams, OekDerivationInfo};
 use crate::error::*;
+use crate::object_lock::add_object_lock_response_headers;
+use crate::versioning::X_AMZ_VERSION_ID;
 
 const X_AMZ_MP_PARTS_COUNT: HeaderName = HeaderName::from_static("x-amz-mp-parts-count");
 
@@ -66,6 +68,13 @@ fn object_headers(
 		resp = resp.header(ETAG, format!("\"{}\"", version_meta.etag));
 	}
 
+	// As in AWS S3, objects that don't have a version id of their own (i.e.
+	// objects of a bucket on which versioning was never enabled) are returned
+	// without a x-amz-version-id header.
+	if version.kind == ObjectVersionKind::Versioned {
+		resp = resp.header(X_AMZ_VERSION_ID, version.version_id());
+	}
+
 	// When metadata is retrieved through the REST API, Amazon S3 combines headers that
 	// have the same name (ignoring case) into a comma-delimited list.
 	// See: https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html
@@ -81,6 +90,8 @@ fn object_headers(
 	for (name, values) in headers_by_name {
 		resp = resp.header(name, values.join(","));
 	}
+
+	resp = add_object_lock_response_headers(version, resp);
 
 	if checksum_mode.enabled {
 		resp = add_checksum_response_headers(&meta_inner.checksum, resp);
@@ -162,14 +173,42 @@ fn handle_http_precondition(
 	}
 }
 
+/// The version of an object that a request refers to: the version whose id is
+/// given by the `versionId` query parameter, or the current version of the
+/// object if the request doesn't specify one.
+fn select_version<'a>(
+	object: &'a Object,
+	version_id: Option<&str>,
+) -> Result<&'a ObjectVersion, Error> {
+	let version = match version_id {
+		Some(version_id) => object
+			.version_by_id(version_id)
+			.ok_or(Error::NoSuchVersion)?,
+		None => object.current_version().ok_or(Error::NoSuchKey)?,
+	};
+
+	if version.is_delete_marker() {
+		// A delete marker has no data to return: asking for it explicitly is an
+		// error, while asking for the current version of an object that has
+		// been deleted is a plain "not found".
+		return Err(match version_id {
+			Some(_) => Error::MethodNotAllowed,
+			None => Error::NoSuchKey,
+		});
+	}
+
+	Ok(version)
+}
+
 /// Handle HEAD request
 pub async fn handle_head(
 	ctx: ReqCtx,
 	req: &Request<()>,
 	key: &str,
 	part_number: Option<u64>,
+	version_id: Option<&str>,
 ) -> Result<Response<ResBody>, Error> {
-	handle_head_without_ctx(ctx.garage, req, ctx.bucket_id, key, part_number).await
+	handle_head_without_ctx(ctx.garage, req, ctx.bucket_id, key, part_number, version_id).await
 }
 
 /// Handle HEAD request for website
@@ -179,6 +218,7 @@ pub async fn handle_head_without_ctx(
 	bucket_id: Uuid,
 	key: &str,
 	part_number: Option<u64>,
+	version_id: Option<&str>,
 ) -> Result<Response<ResBody>, Error> {
 	let object = garage
 		.object_table
@@ -186,12 +226,7 @@ pub async fn handle_head_without_ctx(
 		.await?
 		.ok_or(Error::NoSuchKey)?;
 
-	let object_version = object
-		.versions()
-		.iter()
-		.rev()
-		.find(|v| v.is_data())
-		.ok_or(Error::NoSuchKey)?;
+	let object_version = select_version(&object, version_id)?;
 
 	let version_data = match &object_version.state {
 		ObjectVersionState::Complete(c) => c,
@@ -297,8 +332,18 @@ pub async fn handle_get(
 	key: &str,
 	part_number: Option<u64>,
 	overrides: GetObjectOverrides,
+	version_id: Option<&str>,
 ) -> Result<Response<ResBody>, Error> {
-	handle_get_without_ctx(ctx.garage, req, ctx.bucket_id, key, part_number, overrides).await
+	handle_get_without_ctx(
+		ctx.garage,
+		req,
+		ctx.bucket_id,
+		key,
+		part_number,
+		overrides,
+		version_id,
+	)
+	.await
 }
 
 /// Handle GET request
@@ -309,6 +354,7 @@ pub async fn handle_get_without_ctx(
 	key: &str,
 	part_number: Option<u64>,
 	overrides: GetObjectOverrides,
+	version_id: Option<&str>,
 ) -> Result<Response<ResBody>, Error> {
 	let object = garage
 		.object_table
@@ -316,19 +362,14 @@ pub async fn handle_get_without_ctx(
 		.await?
 		.ok_or(Error::NoSuchKey)?;
 
-	let last_v = object
-		.versions()
-		.iter()
-		.rev()
-		.find(|v| v.is_complete())
-		.ok_or(Error::NoSuchKey)?;
+	let last_v = select_version(&object, version_id)?;
 
 	let last_v_data = match &last_v.state {
 		ObjectVersionState::Complete(x) => x,
 		_ => unreachable!(),
 	};
 	let last_v_meta = match last_v_data {
-		ObjectVersionData::DeleteMarker => return Err(Error::NoSuchKey),
+		ObjectVersionData::DeleteMarker => unreachable!(),
 		ObjectVersionData::Inline(meta, _) => meta,
 		ObjectVersionData::FirstBlock(meta, _) => meta,
 	};
