@@ -129,6 +129,23 @@ print("OK!")
 EOF
 fi
 
+# Bucket versioning and Object Lock
+if [ -z "$SKIP_VERSIONING" ]; then
+  echo "🛠️ Testing bucket versioning and Object Lock with boto3"
+  source ${SCRIPT_FOLDER}/dev-env-aws.sh
+
+  # These get their own buckets: versioning cannot be turned off once it is on,
+  # and the bucket holding compliance-locked versions cannot be deleted at all,
+  # which is exactly the guarantee being tested. dev-clean.sh wipes them at the
+  # start of the next run.
+  for b in versioning-test objectlock-test; do
+    garage -c /tmp/config.1.toml bucket create $b
+    garage -c /tmp/config.1.toml bucket allow $b --read --write --owner --key $AWS_ACCESS_KEY_ID
+  done
+
+  ENDPOINT=http://127.0.0.1:3911 python3 ${SCRIPT_FOLDER}/test-versioning.py
+fi
+
 # Minio Client
 if [ -z "$SKIP_MC" ]; then
   echo "🛠️ Testing with mc (minio client)"

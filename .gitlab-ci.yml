@@ -1,0 +1,107 @@
+# GitLab CI pipeline for Garage.
+#
+# It mirrors .woodpecker/debug.yaml, which is the pipeline upstream runs: every
+# step is a single Nix invocation, so what CI does here is exactly what
+# `nix-build` does on a developer machine. Nothing about the build is described
+# twice.
+#
+# Caching. Each job starts from a bare nixpkgs/nix container and rebuilds
+# whatever it cannot fetch from the substituters in nix/nix.conf, so on a runner
+# with no persistent store Garage itself is compiled once per job. GitLab's own
+# `cache:` cannot help here, as it only handles paths inside the project
+# directory. The fix is to give the runner a persistent /nix volume, in its
+# config.toml:
+#
+#   [runners.docker]
+#     volumes = ["/srv/gitlab-runner/nix:/nix", "/cache"]
+#
+# Until that is set up, the jobs below are grouped rather than split one step
+# per job, so that a cacheless runner still finishes in a reasonable time.
+
+stages:
+  - check
+  - test
+
+variables:
+  # The build derives a version string from the checkout, which a shallow clone
+  # would not be able to produce
+  GIT_DEPTH: "0"
+
+.nix:
+  image: nixpkgs/nix:nixos-24.05
+  interruptible: true
+  before_script:
+    # The substituters and the sandbox setting the Nix build expects
+    - mkdir -p /etc/nix && cp nix/nix.conf /etc/nix/nix.conf
+
+# Formatting, typos and clippy. Grouped because they share the toolchain, which
+# is by far the most expensive thing to have in the store.
+lint:
+  extends: .nix
+  stage: check
+  script:
+    - nix-build -j4 --attr flakePackages.fmt
+    - nix-shell --attr ci --run typos
+    - nix-build -j4 --attr flakePackages.clippy
+
+# Unit tests and the Rust integration test suite, which covers versioning and
+# Object Lock through the AWS SDK for Rust
+test:
+  extends: .nix
+  stage: test
+  script:
+    - nix-build -j4 --attr flakePackages.tests-lmdb
+
+# The same suite on the other database engines. Left manual because it triples
+# the cost of a pipeline and rarely catches anything the lmdb run does not.
+test:other-db-engines:
+  extends: .nix
+  stage: test
+  when: manual
+  allow_failure: true
+  parallel:
+    matrix:
+      - DB_ENGINE: [sqlite, fjall]
+  script:
+    - nix-build -j4 --attr flakePackages.tests-$DB_ENGINE
+
+# End-to-end checks against a real cluster with third-party clients: awscli,
+# s3cmd, minio-client, rclone, and boto3 for versioning and Object Lock.
+smoke:
+  extends: .nix
+  stage: test
+  script:
+    - nix-build -j4 --attr flakePackages.dev
+    - nix-shell --attr ci --run ./script/test-smoke.sh
+  after_script:
+    # Artifacts have to live inside the project directory
+    - cp /tmp/garage.log garage.log || true
+  artifacts:
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - garage.log
+
+# Just the versioning and Object Lock part of the smoke test, for when that is
+# what is being worked on. It is a subset of `smoke`, so it is manual.
+smoke:versioning:
+  extends: .nix
+  stage: test
+  when: manual
+  variables:
+    SKIP_AWS: "1"
+    SKIP_S3CMD: "1"
+    SKIP_BOTO3: "1"
+    SKIP_MC: "1"
+    SKIP_RCLONE: "1"
+    SKIP_WINSCP: "1"
+  script:
+    - nix-build -j4 --attr flakePackages.dev
+    - nix-shell --attr ci --run ./script/test-smoke.sh
+  after_script:
+    - cp /tmp/garage.log garage.log || true
+  artifacts:
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - garage.log
