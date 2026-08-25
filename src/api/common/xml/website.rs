@@ -418,6 +418,6 @@ mod tests {
 </WebsiteConfiguration>"#;
 
 		let serialized = to_xml_with_header(&conf).expect("xml serialization");
-		assert_eq!(unprettify_xml(&serialized), unprettify_xml(&serialized_ref));
+		assert_eq!(unprettify_xml(&serialized), unprettify_xml(serialized_ref));
 	}
 }

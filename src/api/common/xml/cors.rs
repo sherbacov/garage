@@ -217,6 +217,6 @@ mod tests {
 		};
 
 		let message2 = to_xml_with_header(&ref_value).expect("xml serialization");
-		assert_eq!(unprettify_xml(&message), unprettify_xml(&message2));
+		assert_eq!(unprettify_xml(message), unprettify_xml(&message2));
 	}
 }

@@ -1,0 +1,89 @@
+name: CI
+
+# The upstream pipeline (.woodpecker/debug.yaml) drives everything through Nix,
+# which pins the toolchain and gives reproducible builds but rebuilds Garage in
+# every job unless the runner keeps a /nix store around. GitHub runners are
+# thrown away after each job, so this pipeline calls cargo directly and leans on
+# the Rust cache action instead. The toolchain is pinned to the same version
+# nix/compile.nix uses, so both pipelines check the same thing.
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # The fuzzing targets need a nightly toolchain and cargo-fuzz, so they are not
+  # part of any of the jobs below
+  CARGO_WORKSPACE: --workspace --exclude garage-fuzz
+
+jobs:
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      # The same arguments craneLib.cargoClippy is given in nix/compile.nix
+      - run: cargo clippy ${{ env.CARGO_WORKSPACE }} --all-targets -- -D warnings
+
+  test:
+    name: Unit and integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      # Includes the integration tests, which run a real Garage and exercise
+      # versioning and Object Lock through the AWS SDK for Rust
+      - run: cargo test ${{ env.CARGO_WORKSPACE }}
+
+  smoke:
+    name: Versioning and Object Lock end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      # jq and killall are used to set the cluster up, socat for the HTTPS
+      # proxy, boto3 by the versioning check itself
+      - name: Install the tools the smoke test needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq psmisc socat python3-boto3
+
+      - run: cargo build -p garage --bin garage
+
+      # Brings up a three-node cluster and checks versioning and Object Lock
+      # against it with boto3, a client independent from the one the Rust
+      # integration tests use. The other client sections of the smoke test are
+      # skipped, as awscli, s3cmd, minio-client and rclone are not installed.
+      - name: Run the smoke test
+        env:
+          SKIP_AWS: "1"
+          SKIP_S3CMD: "1"
+          SKIP_BOTO3: "1"
+          SKIP_MC: "1"
+          SKIP_RCLONE: "1"
+          SKIP_WINSCP: "1"
+        run: ./script/test-smoke.sh
+
+      - name: Upload the Garage log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garage-log
+          path: /tmp/garage.log
+          if-no-files-found: ignore
